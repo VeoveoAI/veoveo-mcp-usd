@@ -15,6 +15,7 @@ use veoveo_mcp_usd::{
     contract::UsdPermission::{self, StagesRead, StagesRender},
     hub::Hub,
     mcp::UsdMcp,
+    thumbnail::Thumbnails,
 };
 
 fn app_html() -> AppHtml {
@@ -31,9 +32,11 @@ fn hub(granted: &[UsdPermission]) -> TestHub {
     )
     .unwrap();
     let app = app_html();
+    let thumbnails = Thumbnails::new(std::env::temp_dir().join("usd-mcp-test-thumbnails"))
+        .expect("the thumbnails' folder");
     TestHub::new(
         testing::for_domain::<UsdMcp>()
-            .handler(move || Hosted::new(UsdMcp::new(hub.clone(), app.clone())))
+            .handler(move || Hosted::new(UsdMcp::new(hub.clone(), app.clone(), thumbnails.clone())))
             .build(),
     )
     .granting(granted.iter().map(|permission| permission.name()))
@@ -51,7 +54,10 @@ async fn tools_are_listed_with_their_permissions() {
             .filter_map(|tool| tool["name"].as_str())
             .collect();
         names.sort_unstable();
-        assert_eq!(names, ["inspect_stage", "list_scenes", "render_stage"]);
+        assert_eq!(
+            names,
+            ["inspect_stage", "list_scenes", "render_stage", "thumbnail"]
+        );
 
         // Reading does not let you render.
         let reader = hub(&[StagesRead]);
@@ -63,7 +69,7 @@ async fn tools_are_listed_with_their_permissions() {
             .filter_map(|tool| tool["name"].as_str())
             .collect();
         names.sort_unstable();
-        assert_eq!(names, ["inspect_stage", "list_scenes"]);
+        assert_eq!(names, ["inspect_stage", "list_scenes", "thumbnail"]);
 
         // With nothing granted, nothing is admitted.
         let nothing = hub(&[]);

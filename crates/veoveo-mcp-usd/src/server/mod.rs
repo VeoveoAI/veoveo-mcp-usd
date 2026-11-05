@@ -23,6 +23,7 @@ use veoveo_task::{TaskRuntime, TaskRuntimeConfig};
 use crate::{
     hub::Hub,
     mcp::{self, UsdMcp, UsdTasks},
+    thumbnail::Thumbnails,
     viewer,
     work::{self, RenderWork},
 };
@@ -110,7 +111,9 @@ async fn serve(
     )?;
     let worker = TaskWorker::new(runtime.clone()).calls(calls.clone());
     let tasks = UsdTasks::new(runtime.clone(), RENDER_RETENTION);
-    let domain = UsdMcp::new(hub.clone(), app);
+    let thumbnails = Thumbnails::new(args.thumbnail_directory.clone())
+        .context("preparing the thumbnails' folder")?;
+    let domain = UsdMcp::new(hub.clone(), app, thumbnails);
     let stop = CancellationToken::new();
     let mut working = tokio::spawn(work::work(
         worker,

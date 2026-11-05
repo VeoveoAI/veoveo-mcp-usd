@@ -32,6 +32,7 @@ The crate's [`DESIGN.md`](crates/veoveo-mcp-usd/DESIGN.md) describes the domain,
 | `list_scenes` | The repositories you can read, or the scenes of one |
 | `inspect_stage` | What a stage holds, read with `openusd` in the server, as you, with no checkout or disk |
 | `render_stage` | A Task that draws one frame on the GPU and stores a PNG in Artifact |
+| `thumbnail` | A picture of a stage for a gallery, drawn once on the GPU and kept by its content |
 
 `ui://usd/scenes` is a small App that lists the same scenes and opens each in the viewer. `tests/mcp.rs` calls the server
 through the SDK's in-process test Hub, with the permissions each case grants.

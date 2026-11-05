@@ -53,6 +53,13 @@ pub(super) struct Args {
         default_value = "/usr/share/veoveo/usd/viewer"
     )]
     pub viewer_directory: PathBuf,
+    /// Where finished thumbnails are kept, by the content they were drawn from.
+    #[arg(
+        long,
+        env = "VEOVEO_THUMBNAIL_DIRECTORY",
+        default_value = "/var/lib/veoveo/usd/thumbnails"
+    )]
+    pub thumbnail_directory: PathBuf,
     /// The App document served as `ui://usd/scenes`, read once at startup.
     #[arg(
         long,

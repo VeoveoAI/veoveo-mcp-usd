@@ -6,7 +6,7 @@ use std::{fmt, time::Duration};
 use bytes::Bytes;
 use reqwest::{
     StatusCode,
-    header::{ACCEPT, ETAG},
+    header::{ACCEPT, ETAG, RANGE},
 };
 use serde::Deserialize;
 use veoveo_hub_sdk::{
@@ -127,6 +127,15 @@ pub struct File {
     pub revision: Option<String>,
 }
 
+/// What one byte of a file says about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// The file's content address.
+    pub address: String,
+    /// The branch's tip when it was read.
+    pub revision: Option<String>,
+}
+
 /// The Hub, for one caller at one profile.
 #[derive(Clone)]
 pub struct Reader {
@@ -229,6 +238,49 @@ impl Reader {
         let response = self.get(url, LISTING_TIMEOUT).await?;
         let body = response.bytes().await?;
         Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// Reads one byte of a file as the caller, so Lore decides whether they may read it now, and
+    /// what it answers names the file's content address and the branch's tip.
+    pub async fn probe(
+        &self,
+        repository: &RepositoryId,
+        branch: &BranchName,
+        path: &str,
+    ) -> Result<Probe, HubError> {
+        let url = self
+            .hub
+            .files_route(&self.profile, repository, branch, path.split('/'));
+        let bearer = self.client.hub_bearer().await?;
+        let response = self
+            .hub
+            .http
+            .get(url)
+            .bearer_auth(bearer.expose())
+            .header(ACCEPT, "application/octet-stream")
+            .header(RANGE, "bytes=0-0")
+            .timeout(LISTING_TIMEOUT)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.bytes().await?;
+            return Err(HubError::Answered {
+                status,
+                problem: serde_json::from_slice(&body).unwrap_or_default(),
+            });
+        }
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim_matches('"').to_owned())
+        };
+        Ok(Probe {
+            address: header(ETAG.as_str()).unwrap_or_default(),
+            revision: header(REVISION),
+        })
     }
 
     /// A file of `repository`, by the segments of its path.

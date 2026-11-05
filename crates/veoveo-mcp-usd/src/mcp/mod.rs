@@ -21,10 +21,12 @@ use veoveo_mcp_artifact::contract::ArtifactPermission;
 use crate::{
     contract::{
         BranchName, DEFAULT_BRANCH, InspectStageRequest, ListScenesRequest, RenderStageRequest,
-        RenderedStage, RepositorySummary, SceneListing, StageReport, UsdPermission,
+        RenderedStage, RepositorySummary, SceneListing, StageReport, StageThumbnail,
+        ThumbnailRequest, UsdPermission,
     },
     hub::{Hub, HubError, Reader},
     stage::{self, Scope, StageError},
+    thumbnail::Thumbnails,
 };
 
 pub use declarations::{REGISTRATION, registration};
@@ -53,11 +55,16 @@ pub fn force_setup() {
 pub struct UsdMcp {
     hub: Hub,
     app: AppHtml,
+    thumbnails: Thumbnails,
 }
 
 impl UsdMcp {
-    pub fn new(hub: Hub, app: AppHtml) -> Self {
-        Self { hub, app }
+    pub fn new(hub: Hub, app: AppHtml, thumbnails: Thumbnails) -> Self {
+        Self {
+            hub,
+            app,
+            thumbnails,
+        }
     }
 
     fn reader(&self, context: &RequestContext<RoleServer>) -> Result<Reader, McpError> {
@@ -130,6 +137,18 @@ impl UsdMcp {
             .map_err(stage_refused)
     }
 
+    async fn thumbnail(
+        &self,
+        request: ThumbnailRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<StageThumbnail, ToolError> {
+        let reader = self.reader(&context)?;
+        self.thumbnails
+            .thumbnail(&reader, &request)
+            .await
+            .map_err(|error| refused("reading the stage", error))
+    }
+
     async fn render_stage(
         &self,
         _: RenderStageRequest,
@@ -179,14 +198,20 @@ static ROUTES: LazyLock<Routes<UsdMcp>> = LazyLock::new(|| {
             policy(UsdPermission::StagesRender),
             |domain, request, context| async move { domain.render_stage(request, context).await.map_err(Into::into) },
         )
+        .tool::<ThumbnailRequest, _, _>(
+            "Draw a picture of a USD stage in a Lore repository, or say there is none, for a gallery. The first call for a stage draws it on the GPU; later ones answer from what the stage's content drew.",
+            policy(UsdPermission::StagesRead),
+            |domain, request, context| async move { domain.thumbnail(request, context).await },
+        )
         .app(
             AppBuilder::new(app(), APP_NAME)
                 .title("USD scenes")
-                .description("The USD scenes you can read. Choosing one opens it in the viewer.")
+                .description("The USD scenes you can read, as a gallery. Choosing one shows a larger picture and opens it in the viewer.")
                 .policy(policy(UsdPermission::StagesRead))
                 .reader(|domain: UsdMcp, _| async move { Ok(domain.app.clone()) }),
         )
         .app_tools(&app(), &[ListScenesRequest::TOOL], &[UiVisibility::Model, UiVisibility::App])
+        .app_tools(&app(), &[ThumbnailRequest::TOOL], &[UiVisibility::App])
         .build()
 });
 

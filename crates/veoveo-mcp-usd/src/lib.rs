@@ -17,6 +17,8 @@ pub mod server;
 #[cfg(feature = "server")]
 pub mod stage;
 #[cfg(feature = "server")]
+pub mod thumbnail;
+#[cfg(feature = "server")]
 pub mod viewer;
 #[cfg(feature = "server")]
 pub mod work;

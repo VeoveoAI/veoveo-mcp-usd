@@ -14,5 +14,6 @@ pub use resource::{UsdDocument, UsdResource, UsdResourceError};
 pub use stages::{
     DEFAULT_BRANCH, InspectStageRequest, ListScenesRequest, MAX_LISTED, RENDERED_FORMAT,
     RenderCamera, RenderStageRequest, RenderedStage, RepositorySummary, STAGE_FORMAT, Scene,
-    SceneListing, StageReport, TypeCount, VariantChoice, VariantSetReport,
+    SceneListing, StageReport, StageThumbnail, ThumbnailRequest, ThumbnailSize, TypeCount,
+    VariantChoice, VariantSetReport,
 };

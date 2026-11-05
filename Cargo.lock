@@ -7953,7 +7953,7 @@ dependencies = [
 [[package]]
 name = "veoveo-hub-sdk"
 version = "0.1.0"
-source = "git+https://github.com/VeoveoAI/veoveo-hub-sdk?rev=886cb6ab8e32ad412caaf537cf4ba6b92e8e8409#886cb6ab8e32ad412caaf537cf4ba6b92e8e8409"
+source = "git+https://github.com/VeoveoAI/veoveo-hub-sdk?rev=14a649f3e37dca39a4bb29fc39dd03c6565b0490#14a649f3e37dca39a4bb29fc39dd03c6565b0490"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -8004,7 +8004,7 @@ dependencies = [
 [[package]]
 name = "veoveo-hub-sdk-macros"
 version = "0.1.0"
-source = "git+https://github.com/VeoveoAI/veoveo-hub-sdk?rev=886cb6ab8e32ad412caaf537cf4ba6b92e8e8409#886cb6ab8e32ad412caaf537cf4ba6b92e8e8409"
+source = "git+https://github.com/VeoveoAI/veoveo-hub-sdk?rev=14a649f3e37dca39a4bb29fc39dd03c6565b0490#14a649f3e37dca39a4bb29fc39dd03c6565b0490"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8025,7 +8025,7 @@ dependencies = [
 [[package]]
 name = "veoveo-mcp-artifact"
 version = "0.1.0"
-source = "git+https://github.com/VeoveoAI/veoveo-mcp-artifact?rev=ad23b0511068969c94513ad8ad2b8944c8904bb2#ad23b0511068969c94513ad8ad2b8944c8904bb2"
+source = "git+https://github.com/VeoveoAI/veoveo-mcp-artifact?rev=0f6d50106ba3ac3a4e48f3677a743472ebe73a50#0f6d50106ba3ac3a4e48f3677a743472ebe73a50"
 dependencies = [
  "bytes",
  "chrono",
@@ -8050,11 +8050,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "bevy",
  "bytes",
  "clap",
  "dotenvy",
  "futures",
+ "image",
  "openusd",
  "reqwest",
  "rmcp",
@@ -8063,6 +8065,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

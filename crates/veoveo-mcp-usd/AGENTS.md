@@ -5,14 +5,15 @@ operational contract.
 
 ## Purpose
 
-Shows USD stages that live in Lore: `list_scenes`, `inspect_stage`, `render_stage` as a Task, the App `ui://usd/scenes` and the
+Shows USD stages that live in Lore: `list_scenes`, `inspect_stage`, `render_stage` as a Task, `thumbnail`, the App `ui://usd/scenes` and the
 WASM viewer the Hub opens USD files with.
 
 ## Invariants
 
 - Owns the `usd://` URI scheme. It has no tables. Identity: slug `usd`, MCP `/usd/mcp`, viewer `/usd/viewer/`, port 8806.
 - Every read of a scene goes through the Hub's routes with `hub_bearer`, as the caller or the Task's owner, so Lore's rules decide
-  it. Never read Lore another way, and never keep what was read past the request or the step.
+  it. Never read Lore another way, and never keep what was read past the request or the step. The one thing kept is a
+  stage's picture, by the content it was drawn from, which `thumbnail` answers only after reading a byte of the stage as the caller.
 - A tool argument never names a tenant or a person: those come from the forwarded identity.
 - Ready `Routes` bind typed tool requests and readers to their output, permission and cache policy. Discovery, registration,
   annotations and dispatch derive from those routes; do not maintain a separate requirements table.

@@ -65,6 +65,43 @@ pub struct SceneListing {
     pub scenes: Vec<Scene>,
 }
 
+/// How large a thumbnail to draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ThumbnailSize {
+    /// For a gallery's card: 480 pixels wide.
+    #[default]
+    Small,
+    /// For a closer look: 1280 pixels wide.
+    Large,
+}
+
+/// The arguments of `thumbnail`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[veoveo_hub_sdk::tool(provider = UsdProvider, output = StageThumbnail, name = "thumbnail")]
+pub struct ThumbnailRequest {
+    pub repository: RepositoryId,
+    pub branch: BranchName,
+    /// The root stage.
+    pub path: StagePath,
+    #[serde(default)]
+    pub size: ThumbnailSize,
+}
+
+/// A stage's picture, or none when it could not be drawn.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(veoveo_hub_sdk::SingleOutput)]
+pub struct StageThumbnail {
+    /// The picture's media type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    /// The picture, in base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
 /// The arguments of `inspect_stage`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

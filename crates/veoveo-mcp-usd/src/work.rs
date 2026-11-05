@@ -28,7 +28,7 @@ use veoveo_mcp_artifact::{
 use veoveo_task::{StepKey, TaskError, TaskFailure, TaskTransition};
 
 use crate::{
-    contract::{RENDERED_FORMAT, RenderCamera, RenderStageRequest, RenderedStage},
+    contract::{RENDERED_FORMAT, RenderCamera, RenderStageRequest, RenderedStage, VariantChoice},
     hub::{Hub, Reader},
     stage::{self, Gathered, Scope},
 };
@@ -42,6 +42,8 @@ const RENDER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const RENDERED: &str = "Rendered.";
 /// How much of a failed child's output a Task's failure carries.
 const MAX_REPORTED_ERROR: usize = 2048;
+/// The frame's file in a render's folder.
+pub(crate) const FRAME: &str = "frame.png";
 
 /// What a render's work needs.
 #[derive(Clone)]
@@ -223,8 +225,8 @@ fn artifact_name(request: &RenderStageRequest) -> String {
 }
 
 /// What the child drew.
-struct Drawn {
-    output: std::path::PathBuf,
+pub(crate) struct Drawn {
+    pub(crate) output: std::path::PathBuf,
     adapter: String,
     milliseconds: u64,
 }
@@ -249,17 +251,43 @@ fn frame_line(request: &RenderStageRequest, output: &Path) -> anyhow::Result<Str
     })
 }
 
-/// Writes the stage's files in their repository layout under `folder`, and draws one frame in a
-/// child process, which a cancelled Task kills.
+/// Draws `request`'s one frame, in a child process that a cancelled Task kills.
 async fn draw(
     ctx: &TaskContext,
     folder: &Path,
     gathered: Gathered,
     request: &RenderStageRequest,
 ) -> anyhow::Result<Drawn> {
-    let output = folder.join("frame.png");
+    let line = frame_line(request, &folder.join(FRAME))?;
+    draw_frame(
+        folder,
+        gathered,
+        &line,
+        &request.variants,
+        RENDER_TIMEOUT,
+        async {
+            ctx.cancelled().await;
+            match ctx.checkpoint().await {
+                Err(error) => anyhow::Error::from(error),
+                Ok(_) => anyhow!("the render was stopped"),
+            }
+        },
+    )
+    .await
+}
+
+/// Writes the stage's files in their repository layout under `folder` and draws the frame `line`
+/// asks for in a child process, which `stopped` or `timeout` kills. `stopped` says why.
+pub(crate) async fn draw_frame(
+    folder: &Path,
+    gathered: Gathered,
+    line: &str,
+    variants: &[VariantChoice],
+    timeout: Duration,
+    stopped: impl Future<Output = anyhow::Error>,
+) -> anyhow::Result<Drawn> {
+    let output = folder.join(FRAME);
     let frames = folder.join("frames.txt");
-    let line = frame_line(request, &output)?;
     let files = folder.join("files");
     let stage = files.join(gathered.root.as_str());
     {
@@ -280,7 +308,7 @@ async fn draw(
     tokio::fs::write(&frames, line).await?;
     let mut command = tokio::process::Command::new(std::env::current_exe()?);
     command.arg("render").arg(&stage).arg(&frames);
-    for choice in &request.variants {
+    for choice in variants {
         command
             .arg("--variant")
             .arg(choice.prim.as_str())
@@ -299,14 +327,11 @@ async fn draw(
     let started = Instant::now();
     let child = command.spawn().context("starting the render")?;
     let finished = tokio::select! {
-        finished = tokio::time::timeout(RENDER_TIMEOUT, child.wait_with_output()) => finished,
-        () = ctx.cancelled() => {
-            ctx.checkpoint().await?;
-            bail!("the render was stopped");
-        }
+        finished = tokio::time::timeout(timeout, child.wait_with_output()) => finished,
+        error = stopped => return Err(error),
     };
     let finished = finished
-        .map_err(|_| anyhow!("the render took longer than {RENDER_TIMEOUT:?}"))?
+        .map_err(|_| anyhow!("the render took longer than {timeout:?}"))?
         .context("waiting for the render")?;
     let stdout = String::from_utf8_lossy(&finished.stdout);
     if !finished.status.success() {
