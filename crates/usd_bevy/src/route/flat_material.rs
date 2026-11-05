@@ -25,7 +25,12 @@ pub(crate) fn configure(app: &mut App) {
     // The material's plugin loads these as it is added, so their bytes come first.
     bevy::asset::embedded_asset!(app, "flat_material.wesl");
     bevy::asset::embedded_asset!(app, "flat_prepass.wesl");
-    if super::wrapped::configure::<FlatNormals>(app) {
+    // Skinning configures this in an app with no renderer too, which has no shaders to load.
+    if super::wrapped::configure::<FlatNormals>(app)
+        && app
+            .world()
+            .contains_resource::<Assets<bevy::shader::Shader>>()
+    {
         bevy::shader::load_shader_library!(app, "flat_functions.wesl");
     }
 }

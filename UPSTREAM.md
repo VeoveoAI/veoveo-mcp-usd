@@ -50,7 +50,8 @@ Left out: `assets/external`, `media`, `src` (`usdview`) and its dependency `mara
 - **WESL modules imported only by name are loaded.** `import usd_bevy::route::gpu_instancing_types::...` needs that module
   registered, and `embedded_asset!` only stores its bytes, while Bevy's loader follows asset-path imports and not package
   ones. So `gpu_instancing_types`, `sheen_functions`, `strand_functions` and `flat_functions` now go through
-  `load_shader_library!`. Without it, the GPU instancer's pipeline waited for ever on an unresolved import.
+  `load_shader_library!`. Without it, the GPU instancer's pipeline waited for ever on an unresolved import. `flat_functions`
+  loads only where `Shader` is an asset, since skinning configures that material in apps with no renderer too.
 - **A material's shader bytes come before its plugin.** `flat_material`, `sheen_material`, `strand_material` and
   `medium_material` added `MaterialPlugin` and then `embedded_asset!`, while the plugin's load runs on another thread. It
   lost that race on some runs (`Path not found: usd_bevy/route/flat_material.wesl`), and the bytes now come first.
