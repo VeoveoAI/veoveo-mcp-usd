@@ -16,6 +16,8 @@ A scene is a folder at the top level of a Lore repository, whose root stage is `
    - `time`, a time code in the stage's range; by default its start.
    - `camera`, either `{"prim": "/path"}`, one of the stage's cameras, or `{"eye": [x, y, z], "focus": [x, y, z]}`; by
      default the whole stage is framed.
+     Nothing reports where a prim is, so a close-up is guesswork: unless the person gave a view, render the default once and
+     give them the viewer's address below, where they can look closer themselves.
    - `variants`, a list of `{"prim", "set", "selection"}`.
 
    Its product's `resultUri` is the PNG in Artifact, whose metadata names the repository, revision and path. Renders can be
