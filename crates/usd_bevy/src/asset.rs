@@ -507,7 +507,13 @@ struct ProjectionTurn(Option<Entity>);
 
 impl Default for UsdProjectionBudget {
     fn default() -> Self {
-        Self(std::time::Duration::from_millis(10))
+        // A wall-clock budget makes a test that projects in one update depend on machine load.
+        // A test of spreading over frames sets its own budget.
+        Self(if cfg!(test) {
+            std::time::Duration::MAX
+        } else {
+            std::time::Duration::from_millis(10)
+        })
     }
 }
 

@@ -43,3 +43,7 @@ Left out: `assets/external`, `media`, `src` (`usdview`) and its dependency `mara
   - `asset::tests::bevy_reload_serializes_older_successful_source_reads`
 
   Hot reload is therefore unordered here, if anything ever uses it.
+- **Tests no longer depend on machine load.** `UsdProjectionBudget` defaults to a 10 ms wall-clock budget per frame, and many
+  tests expect a scene to finish projecting in one update. Under CPU load, about a third of 300 runs of one such test failed,
+  and 14 tests failed across six runs of the suite. Its default is unbounded under `cfg(test)`, and all 644 tests then passed
+  six runs under the same load. Outside tests it stays 10 ms.
