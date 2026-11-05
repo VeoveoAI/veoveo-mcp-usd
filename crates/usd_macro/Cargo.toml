@@ -3,6 +3,7 @@ name = "usd_macro"
 version = "0.0.1"
 edition = "2024"
 license = "MIT"
+publish = false
 description = "The `usd!` inline-USD macro: compile-time-validated usda snippets for usd_bevy."
 repository = "https://github.com/bresilla/bevy_openusd"
 
@@ -15,3 +16,7 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 # Compile-time USDA validation.
 openusd = { git = "https://github.com/mxpv/openusd", rev = "d10fa4c2838e1e18a5c4fb4aa47534f94fde8995" }
+
+# Copied from upstream, which does not run clippy; rustc warnings still fail the gate.
+[lints.clippy]
+all = { level = "allow", priority = -1 }

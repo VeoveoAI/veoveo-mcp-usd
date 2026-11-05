@@ -2313,40 +2313,6 @@ def NodeGraph "Graph" {}
         assert!(world.get_resource::<PrimEntities>().is_none());
     }
 
-    /// Kitchen_set.usdz's root layer is `Kitchen_set.usd`, so this exercises
-    /// the openusd USDZ `.usd`-layer content-sniff fix (without it the stage
-    /// won't even open). NOTE: its geometry is behind references to other
-    /// files *inside* the usdz, which openusd doesn't resolve yet — so the
-    /// composed stage is structure-only (0 meshes). See OPENUSD_ISSUE.md.
-    #[test]
-    fn loads_kitchen_usdz() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/external/Kitchen_set.usdz"
-        );
-        let stage = Stage::builder()
-            .schema_registry(openusd_schemas::schema_registry())
-            .open(path)
-            .expect("Kitchen_set.usdz should open");
-        let mut meshes = 0usize;
-        let _ = stage.traverse(
-            openusd::usd::PrimPredicate::default(),
-            |p: &openusd::sdf::Path| {
-                if let Ok(Some(m)) = crate::read::geom::read_mesh(&stage, p)
-                    && !m.points.is_empty()
-                {
-                    meshes += 1;
-                }
-            },
-        );
-        // Kitchen's geometry is behind references to other files *inside* the
-        // usdz; this asserts the openusd package-resolution fix resolves them.
-        println!("KITCHEN meshes: {meshes}");
-        assert!(
-            meshes > 1000,
-            "kitchen packaged meshes should resolve, got {meshes}"
-        );
-    }
     use openusd::vt::Value;
 
     fn tx(stage: &Stage, prim: &str) -> Option<Vec3> {

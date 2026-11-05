@@ -3,6 +3,7 @@ name = "usd_bevy"
 version = "0.0.1"
 edition = "2024"
 license = "MIT"
+publish = false
 description = "Live OpenUSD editor for Bevy: stage projection, change-driven sync, authoring, persistence."
 repository = "https://github.com/bresilla/bevy_openusd"
 
@@ -48,3 +49,7 @@ bevy_pbr = { version = "0.20.1", default-features = false, features = ["pbr_mult
 
 [dev-dependencies]
 png = "0.18"
+
+# Copied from upstream, which does not run clippy; rustc warnings still fail the gate.
+[lints.clippy]
+all = { level = "allow", priority = -1 }

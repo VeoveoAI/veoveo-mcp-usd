@@ -8,6 +8,12 @@ a tool, reads it at its address and pages through the tenant's items. The server
 its items in its own PostgreSQL schema and serves them over MCP through
 `veoveo-hub-sdk`.
 
+## Copied Crates
+
+`crates/usd_bevy` and `crates/usd_macro` are copied from `bevy_openusd`, with the tests' `assets/`, and
+[UPSTREAM.md](../../UPSTREAM.md) records the source commit and every change. They live in this workspace and pass its gate,
+except that they allow `clippy::all` so that they stay close to upstream. Nothing else in this repository depends on them yet.
+
 ## Service Identity
 
 ```text

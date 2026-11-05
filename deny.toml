@@ -4,7 +4,9 @@
 all-features = true
 
 [advisories]
-ignore = []
+# paste is unmaintained, with no vulnerability and no safe upgrade. It is a compile-time macro,
+# reached only through bevy_image, image, exr and pulp.
+ignore = [{ id = "RUSTSEC-2024-0436", reason = "unmaintained, compile-time only, through Bevy's image stack" }]
 
 [licenses]
 # Licenses compatible with distributing an Apache-2.0 project. Add a license here only
@@ -24,7 +26,8 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
-exceptions = []
+# notify, through bevy_asset's file watcher: CC0-1.0 dedicates the code to the public domain.
+exceptions = [{ crate = "notify", allow = ["CC0-1.0"] }]
 
 [licenses.private]
 ignore = true
@@ -38,6 +41,7 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/mxpv/openusd"]
 
 [sources.allow-org]
 github = ["VeoveoAI"]

@@ -26,3 +26,13 @@ Left out: `assets/external`, `media`, `src` (`usdview`) and its dependency `mara
   edits, so it stays removed. Its `usdview` and `mara` changes are left out. Then Bevy 0.20.1.
 - **`zip` 9.3.0,** from 8, because 8.6.0 has open advisories (RUSTSEC-2026-0367, 0368, 0369 and 0429). `name()` now returns a
   `Result`, in `reload.rs` and in `persistence.rs`'s tests.
+- **Deprecated calls.** `Mat4::perspective_rh` becomes `bevy::math::proj::perspective` in four tests, as Bevy's `glam` asks,
+  because rustc warnings fail our gate. `crates/usd_bevy/src/read/xform.rs` keeps it, on upstream's own `glam` 0.30.
+- **Manifests.** Both crates are `publish = false`, as `cargo deny` requires of path dependencies, and allow `clippy::all`,
+  since upstream does not run clippy and fixing 110 findings would only move this copy further from it. rustc warnings,
+  rustfmt, `cargo deny` and the tests still apply to them.
+- **Tests that need a left-out asset are removed:**
+  - `source::tests::usdc_empty_string_arrays_read_as_empty`, on `assets/external/chameleon.usdz`
+  - `live::tests::loads_kitchen_usdz`, on `assets/external/Kitchen_set.usdz`
+
+  Both scenes go into the `usd-demo` Lore repository.

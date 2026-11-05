@@ -17,6 +17,7 @@ domain, which the USD server replaces.
 | `.config/nextest.toml` | Test profiles for local runs and machine-readable results |
 | `.cargo/config.toml` | `SQLX_OFFLINE`, so every build reads the committed query metadata |
 | `.sqlx/` | sqlx's checked metadata for every query the workspace compiles |
+| `crates/usd_bevy/`, `crates/usd_macro/`, `assets/`, `upstream-examples/`, `UPSTREAM.md` | OpenUSD for Bevy, copied from `bevy_openusd`, and what we changed |
 | `crates/veoveo-mcp-usd/` | The server: its contract, MCP surface, store, binary, migrations, tests and the documents it serves |
 | `crates/*/migrations/` | The server's schema, applied in its own PostgreSQL schema at startup |
 
