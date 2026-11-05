@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Copied unchanged until the next commit moves them to the Bevy this workspace builds.
+exclude = ["crates/usd_bevy", "crates/usd_macro"]
 
 [workspace.package]
 version = "0.1.0"

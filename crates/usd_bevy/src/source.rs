@@ -1,0 +1,3325 @@
+//! Byte-backed root layers with filesystem-relative dependency resolution.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use openusd::ar::{Asset, AssetBuffer, DefaultResolver, ResolvedPath, Resolver, SharedBuffer};
+use openusd::usd::Stage;
+
+static NEXT_SOURCE: AtomicU64 = AtomicU64::new(0);
+
+/// Virtual directory that anchors `UsdSource::from_memory` files; never on disk.
+const MEMORY_ROOT: &str = "__usd_memory__";
+
+pub(crate) type DiskBaselines = Arc<EditorDisk>;
+
+/// Reads one dependency by identifier, or `None` when it cannot be read.
+pub(crate) type Fetch = Arc<dyn Fn(&str) -> Option<Arc<[u8]>> + Send + Sync>;
+
+/// Reads missing dependencies while a probe composes, so one composition
+/// discovers every file, and keeps what it read for the source.
+#[derive(Clone)]
+pub(crate) struct Fetcher {
+    read: Fetch,
+    fetched: Arc<Mutex<BTreeMap<String, Option<Arc<[u8]>>>>>,
+}
+
+impl std::fmt::Debug for Fetcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fetcher").finish_non_exhaustive()
+    }
+}
+
+impl Fetcher {
+    pub(crate) fn new(read: Fetch) -> Self {
+        Self {
+            read,
+            fetched: Arc::default(),
+        }
+    }
+
+    /// The bytes of `identifier`, read now and not recorded as fetched.
+    pub(crate) fn read_now(&self, identifier: &str) -> Option<Arc<[u8]>> {
+        (self.read)(identifier)
+    }
+
+    /// The bytes of `identifier`, read on first request.
+    fn get(&self, identifier: &str) -> Option<Arc<[u8]>> {
+        if let Some(bytes) = self.peek(identifier) {
+            return bytes;
+        }
+        let bytes = (self.read)(identifier);
+        self.fetched
+            .lock()
+            .expect("fetched dependencies")
+            .insert(identifier.to_owned(), bytes.clone());
+        bytes
+    }
+
+    /// What an earlier request for `identifier` read, if one ran.
+    fn peek(&self, identifier: &str) -> Option<Option<Arc<[u8]>>> {
+        self.fetched
+            .lock()
+            .expect("fetched dependencies")
+            .get(identifier)
+            .cloned()
+    }
+
+    /// Everything read so far, `None` for reads that failed.
+    pub(crate) fn take(&self) -> BTreeMap<String, Option<Arc<[u8]>>> {
+        std::mem::take(&mut *self.fetched.lock().expect("fetched dependencies"))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct EditorDisk {
+    hashes: Mutex<BTreeMap<PathBuf, blake3::Hash>>,
+    pub replacements: Mutex<BTreeMap<String, Arc<[u8]>>>,
+    pub snapshots: Mutex<BTreeMap<String, Arc<[u8]>>>,
+}
+
+impl std::ops::Deref for EditorDisk {
+    type Target = Mutex<BTreeMap<PathBuf, blake3::Hash>>;
+    fn deref(&self) -> &Self::Target {
+        &self.hashes
+    }
+}
+
+/// The token a UDIM texture set puts where each tile's number goes.
+pub(crate) const UDIM: &str = "<UDIM>";
+
+/// The tiles a UDIM set may name, `1001` through `1100`, with their files.
+pub(crate) fn udim_tiles(pattern: &str) -> impl Iterator<Item = (u32, String)> + '_ {
+    (1001..=1100).map(move |tile| (tile, pattern.replace(UDIM, &tile.to_string())))
+}
+
+/// Textures a stage asks for, each with whether it is sRGB.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TextureRequests {
+    pub(crate) textures: BTreeSet<(String, bool)>,
+    /// Requested only by dome lights, which read them on the CPU.
+    pub(crate) environment_only: BTreeSet<String>,
+}
+
+impl std::ops::Deref for TextureRequests {
+    type Target = BTreeSet<(String, bool)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.textures
+    }
+}
+
+impl<'a> IntoIterator for &'a TextureRequests {
+    type Item = &'a (String, bool);
+    type IntoIter = std::collections::btree_set::Iter<'a, (String, bool)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.textures.iter()
+    }
+}
+
+/// An immutable root-layer snapshot anchored at its source filename.
+#[derive(Clone, Debug)]
+pub struct UsdSource {
+    identifier: String,
+    bytes: Arc<[u8]>,
+    identity: u64,
+    files: Arc<BTreeMap<String, Arc<[u8]>>>,
+    absent: Arc<BTreeSet<String>>,
+    filesystem: bool,
+    validated_default: Arc<Mutex<Option<u64>>>,
+    default_textures: Arc<Mutex<Option<(u64, Arc<TextureRequests>)>>>,
+    /// Reads files the snapshot lacks when a stage asks for them.
+    fetch: Option<Fetcher>,
+}
+
+impl UsdSource {
+    /// Builds a snapshot-only USDA root using canonical typed schema APIs.
+    /// The callback authors one root layer; dependencies are composed afterward
+    /// with `with_dependency` and the reference helpers. No source file is written.
+    pub fn build(
+        path: impl AsRef<Path>,
+        author: impl FnOnce(&Stage) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            path.as_ref()
+                .extension()
+                .is_some_and(|extension| extension == "usda"),
+            "typed source construction requires a .usda identifier"
+        );
+        let mut source = Self::snapshot(path, b"#usda 1.0\n".as_slice())?;
+        let stage = source.open_stage()?;
+        author(&stage)?;
+        anyhow::ensure!(
+            stage.layer_identifiers().len() == 1,
+            "typed source construction accepts one root layer; compose dependencies afterward"
+        );
+        Self::validate_composition(&stage)?;
+        source.bytes = stage.root_layer().export_to_string()?.into_bytes().into();
+        Self::validate_composition(&source.open_stage()?)?;
+        Ok(source)
+    }
+
+    /// Anchor bytes at a filename without creating that file.
+    pub fn new(path: impl AsRef<Path>, bytes: impl Into<Arc<[u8]>>) -> io::Result<Self> {
+        let absolute = absolute(path.as_ref())?;
+        let raw = absolute.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "USD source path is not UTF-8")
+        })?;
+        let identifier = DefaultResolver::new().create_identifier(raw, None);
+        Ok(Self {
+            identifier,
+            bytes: bytes.into(),
+            identity: NEXT_SOURCE.fetch_add(1, Ordering::Relaxed),
+            files: Arc::default(),
+            absent: Arc::default(),
+            filesystem: true,
+            validated_default: Arc::default(),
+            default_textures: Arc::default(),
+            fetch: None,
+        })
+    }
+
+    /// Reads an immutable root-layer snapshot from a file.
+    pub fn from_file(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        let bytes = read_file_snapshot(path)?;
+        Self::new(path, bytes)
+    }
+
+    pub fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    pub(crate) fn filesystem_backed(&self) -> bool {
+        self.filesystem
+    }
+
+    pub fn dependencies(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
+    pub(crate) fn revision(&self) -> u64 {
+        self.identity
+    }
+
+    pub(crate) fn has_default_validation(&self) -> bool {
+        !self.filesystem
+            && *self.validated_default.lock().expect("source validation") == Some(self.identity)
+    }
+
+    pub(crate) fn record_default_validation(&self) {
+        if !self.filesystem {
+            *self.validated_default.lock().expect("source validation") = Some(self.identity);
+        }
+    }
+
+    pub(crate) fn read_asset(&self, identifier: &str) -> io::Result<Vec<u8>> {
+        if !rooted(Path::new(identifier)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unresolved asset identifier: {identifier}"),
+            ));
+        }
+        SourceResolver {
+            source: self.clone(),
+            fallback: DefaultResolver::new(),
+            requests: Arc::default(),
+            disk_baselines: None,
+            fetch: None,
+        }
+        .open_asset(&ResolvedPath::new(identifier))?
+        .read_all()
+    }
+
+    /// `default_composition` requires a freshly opened stage without overrides or edits.
+    pub(crate) fn texture_requests(
+        &self,
+        stage: &Stage,
+        default_composition: bool,
+    ) -> Result<Arc<TextureRequests>, String> {
+        let reusable = default_composition && !self.filesystem;
+        if reusable
+            && let Some((revision, requests)) =
+                &*self.default_textures.lock().expect("source textures")
+            && *revision == self.identity
+        {
+            return Ok(requests.clone());
+        }
+        let requests = Arc::new(Self::stage_texture_requests(stage)?);
+        if reusable {
+            *self.default_textures.lock().expect("source textures") =
+                Some((self.identity, requests.clone()));
+        }
+        Ok(requests)
+    }
+
+    /// UDIM sets the materials bound to geometry read, as `(pattern, srgb)`.
+    /// Unbound materials' sets are left out, so a scene's unused full-quality
+    /// looks cost nothing.
+    pub(crate) fn bound_udim_requests(stage: &Stage) -> Result<BTreeSet<(String, bool)>, String> {
+        let mut paths = Vec::new();
+        stage
+            .traverse(openusd::usd::PrimPredicate::DEFAULT_PROXIES, |path| {
+                paths.push(path.clone());
+            })
+            .map_err(|error| error.to_string())?;
+        let mut materials = BTreeSet::new();
+        for path in paths {
+            let prim = stage.prim(&path).map_err(|error| error.to_string())?;
+            let kind = prim.type_name().map_err(|error| error.to_string())?;
+            if matches!(
+                kind.as_deref(),
+                Some("Mesh" | "BasisCurves" | "NurbsCurves" | "HermiteCurves" | "Points")
+            ) && let Ok(Some(material)) = crate::read::shade::read_material_binding(stage, &path)
+            {
+                materials.insert(material);
+            }
+        }
+        let materials: Vec<_> = materials.into_iter().collect();
+        Ok(Self::texture_requests_for_prims(stage, &materials)?
+            .textures
+            .into_iter()
+            .filter(|(path, _)| path.contains(UDIM))
+            .collect())
+    }
+
+    /// Reads the tiles of a UDIM set into the snapshot, returning how many it holds.
+    pub(crate) fn fetch_udim_tiles(&mut self, fetcher: &Fetcher, pattern: &str) -> usize {
+        let mut held = 0;
+        for (_, identifier) in udim_tiles(pattern) {
+            if self.read_asset(&identifier).is_ok() {
+                held += 1;
+            } else if let Some(bytes) = fetcher.read_now(&identifier) {
+                self.insert_dependency(identifier, bytes);
+                held += 1;
+            }
+        }
+        held
+    }
+
+    pub(crate) fn stage_texture_requests(stage: &Stage) -> Result<TextureRequests, String> {
+        Self::texture_requests_for_prims(stage, &Self::stage_texture_prims(stage)?)
+    }
+
+    pub(crate) fn stage_texture_prims(stage: &Stage) -> Result<Vec<openusd::sdf::Path>, String> {
+        let mut paths = Vec::new();
+        stage
+            .traverse(openusd::usd::PrimPredicate::DEFAULT_PROXIES, |path| {
+                paths.push(path.clone());
+            })
+            .map_err(|error| error.to_string())?;
+        let mut candidates = Vec::new();
+        for path in paths {
+            let prim = stage.prim(&path).map_err(|error| error.to_string())?;
+            let kind = prim.type_name().map_err(|error| error.to_string())?;
+            if matches!(
+                kind.as_deref(),
+                Some("Material" | "DomeLight" | "DomeLight_1")
+            ) {
+                candidates.push(path);
+            }
+        }
+        Ok(candidates)
+    }
+
+    pub(crate) fn texture_requests_for_prims(
+        stage: &Stage,
+        paths: &[openusd::sdf::Path],
+    ) -> Result<TextureRequests, String> {
+        let mut requests = BTreeSet::new();
+        let mut environment = BTreeSet::new();
+        let mut materials = BTreeSet::new();
+        for path in paths {
+            let prim = stage.prim(path).map_err(|error| error.to_string())?;
+            let type_name = prim.type_name().map_err(|error| error.to_string())?;
+            if matches!(type_name.as_deref(), Some("DomeLight" | "DomeLight_1")) {
+                let attr = prim.attribute("inputs:texture:file");
+                let mut times = vec![None];
+                times.extend(
+                    attr.time_sample_times()
+                        .map_err(|error| error.to_string())?
+                        .into_iter()
+                        .map(|time| Some(openusd::usd::TimeCode::new(time))),
+                );
+                for time in times {
+                    let path = crate::route::dome::asset_string(
+                        attr.get_at::<openusd::vt::Value>(time)
+                            .map_err(|error| error.to_string())?,
+                    );
+                    if !path.is_empty() {
+                        environment.insert(path.clone());
+                        requests.insert((path, false));
+                    }
+                }
+                continue;
+            }
+            if type_name.as_deref() != Some("Material") {
+                continue;
+            }
+            let texture_times = crate::read::shade::material_texture_sample_times(stage, &path)
+                .map_err(|error| error.to_string())?;
+            for time in std::iter::once(None).chain(texture_times.into_iter().map(Some)) {
+                let Some(material) =
+                    crate::read::shade::read_preview_material_at(stage, &path, time)
+                        .map_err(|error| error.to_string())?
+                else {
+                    continue;
+                };
+                for (path, srgb) in [
+                    (&material.diffuse_texture, material.texture_srgb("diffuse")),
+                    (
+                        &material.emissive_texture,
+                        material.texture_srgb("emissive"),
+                    ),
+                    (&material.normal_texture, material.texture_srgb("normal")),
+                    (
+                        &material.metallic_texture,
+                        material.texture_srgb("metallic"),
+                    ),
+                    (
+                        &material.roughness_texture,
+                        material.texture_srgb("roughness"),
+                    ),
+                    (
+                        &material.clearcoat_texture,
+                        material.texture_srgb("clearcoat"),
+                    ),
+                    (
+                        &material.clearcoat_roughness_texture,
+                        material.texture_srgb("clearcoat_roughness"),
+                    ),
+                    (
+                        &material.occlusion_texture,
+                        material.texture_srgb("occlusion"),
+                    ),
+                    (&material.opacity_texture, material.texture_srgb("opacity")),
+                ] {
+                    if let Some(path) = path {
+                        materials.insert(path.clone());
+                        requests.insert((path.clone(), srgb));
+                    }
+                }
+            }
+        }
+        environment.retain(|path| !materials.contains(path));
+        Ok(TextureRequests {
+            textures: requests,
+            environment_only: environment,
+        })
+    }
+
+    /// Anchor bytes without allowing filesystem fallback for missing dependencies.
+    /// Bytes may represent a USD layer, package, or opaque dependency asset.
+    pub fn snapshot(path: impl AsRef<Path>, bytes: impl Into<Arc<[u8]>>) -> io::Result<Self> {
+        let mut source = Self::new(normalize(&absolute(path.as_ref())?), bytes)?;
+        source.filesystem = false;
+        Ok(source)
+    }
+
+    /// Snapshot of `root` among in-memory `files`, keyed by `/`-separated paths
+    /// relative to one virtual directory, e.g. files a browser user picked.
+    /// Nothing is read from disk; see [`Self::missing_dependencies`].
+    pub fn from_memory<P: AsRef<str>, B: Into<Arc<[u8]>>>(
+        root: &str,
+        files: impl IntoIterator<Item = (P, B)>,
+    ) -> io::Result<Self> {
+        let base = absolute(Path::new(MEMORY_ROOT))?;
+        let locate = |path: &str| -> io::Result<PathBuf> {
+            let located = normalize(&base.join(path));
+            if rooted(Path::new(path)) || !located.starts_with(&base) || located == base {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("in-memory USD path must stay relative: {path}"),
+                ));
+            }
+            Ok(located)
+        };
+        let root = locate(root)?;
+        let mut root_bytes = None;
+        let mut dependencies = Vec::new();
+        for (path, bytes) in files {
+            let path = locate(path.as_ref())?;
+            if path == root {
+                root_bytes = Some(bytes.into());
+            } else {
+                dependencies.push((path.to_string_lossy().into_owned(), bytes.into()));
+            }
+        }
+        let bytes = root_bytes.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("root is not among the in-memory files: {}", root.display()),
+            )
+        })?;
+        let mut source = Self::snapshot(root, bytes)?;
+        for (identifier, bytes) in dependencies {
+            source.insert_dependency(identifier, bytes);
+        }
+        Ok(source)
+    }
+
+    /// Layers and textures the composed stage requests that this snapshot
+    /// lacks. In-memory paths come back relative, as `from_memory` takes them;
+    /// sources that fall back to the filesystem report none.
+    pub fn missing_dependencies(&self) -> Vec<String> {
+        let base = absolute(Path::new(MEMORY_ROOT)).ok();
+        self.probe_stage()
+            .1
+            .into_iter()
+            .map(|identifier| {
+                base.as_ref()
+                    .and_then(|base| Path::new(&identifier).strip_prefix(base).ok())
+                    .map_or_else(
+                        || identifier.clone(),
+                        |relative| relative.to_string_lossy().into_owned(),
+                    )
+            })
+            .collect()
+    }
+
+    /// Return a snapshot containing another source and its captured dependencies.
+    /// Identical identifiers must have identical bytes. The receiver's filesystem
+    /// fallback policy is retained; no dependency files are read or created.
+    pub fn with_dependency(&self, dependency: &Self) -> io::Result<Self> {
+        let mut combined = self.clone();
+        let mut changed = false;
+        for (identifier, bytes) in std::iter::once((&dependency.identifier, &dependency.bytes))
+            .chain(dependency.files.iter())
+        {
+            let existing = if identifier == &combined.identifier {
+                Some(&combined.bytes)
+            } else {
+                combined.files.get(identifier)
+            };
+            if let Some(existing) = existing {
+                if existing.as_ref() != bytes.as_ref() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("conflicting USD source bytes: {identifier}"),
+                    ));
+                }
+            } else {
+                Arc::make_mut(&mut combined.files).insert(identifier.clone(), bytes.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            combined.identity = NEXT_SOURCE.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(combined)
+    }
+
+    /// Applies typed editor commands atomically to a USDA root snapshot.
+    /// Retains captured dependencies and filesystem policy; never writes input files.
+    /// New asset dependencies must be supplied with `with_dependency` or resolve
+    /// through the receiver's filesystem policy. Empty batches preserve identity.
+    pub fn with_edits(
+        &self,
+        edits: impl IntoIterator<Item = crate::editor::EditorEdit>,
+    ) -> anyhow::Result<Self> {
+        let edits: Vec<_> = edits.into_iter().collect();
+        if edits.is_empty() {
+            return Ok(self.clone());
+        }
+        anyhow::ensure!(
+            self.identifier.ends_with(".usda"),
+            "snapshot editing requires a .usda root identifier"
+        );
+        let mut editor = crate::editor::EditorSession::new(self.open_stage()?);
+        editor.edit(crate::editor::EditorEdit::Batch(edits))?;
+        Self::validate_composition(editor.stage())?;
+        let mut edited = self.clone();
+        edited.bytes = editor
+            .stage()
+            .root_layer()
+            .export_to_string()?
+            .into_bytes()
+            .into();
+        edited.identity = NEXT_SOURCE.fetch_add(1, Ordering::Relaxed);
+        Ok(edited)
+    }
+
+    /// Mounts a source prim at a new absolute prim path in a USDA root snapshot.
+    /// Captured dependencies and the receiver's filesystem policy are retained.
+    /// Existing destinations, missing targets and conflicting source bytes fail.
+    /// An empty typed target path references the dependency's defaultPrim.
+    pub fn with_reference(
+        &self,
+        destination: impl openusd::sdf::IntoPath,
+        dependency: &Self,
+        target: impl openusd::sdf::IntoPath,
+    ) -> anyhow::Result<Self> {
+        self.with_references([(destination, dependency, target)])
+    }
+
+    /// Atomically mounts (destination, source, target) entries in iterator order.
+    /// Opens one assembly stage and one validation stage per distinct source snapshot.
+    /// An empty batch returns an unchanged snapshot; inputs are never mutated.
+    pub fn with_references<'a, D: openusd::sdf::IntoPath, T: openusd::sdf::IntoPath>(
+        &self,
+        references: impl IntoIterator<Item = (D, &'a Self, T)>,
+    ) -> anyhow::Result<Self> {
+        self.with_offset_references(references.into_iter().map(|(destination, source, target)| {
+            (
+                destination,
+                source,
+                target,
+                openusd::sdf::LayerOffset::IDENTITY,
+            )
+        }))
+    }
+
+    /// Atomically mounts (destination, source, target, time offset) entries.
+    /// Offsets must be finite and scales finite and positive.
+    /// Empty typed target paths select defaultPrim; input snapshots stay unchanged.
+    pub fn with_offset_references<'a, D: openusd::sdf::IntoPath, T: openusd::sdf::IntoPath>(
+        &self,
+        references: impl IntoIterator<Item = (D, &'a Self, T, openusd::sdf::LayerOffset)>,
+    ) -> anyhow::Result<Self> {
+        self.assemble_references(references, false)
+    }
+
+    /// Mounts retimed references with instanceable metadata on every destination.
+    /// Entries use (destination, source, target, offset); descendants are USD proxies.
+    /// Composition determines prototype sharing; offsets follow with_offset_references.
+    pub fn with_instanceable_references<
+        'a,
+        D: openusd::sdf::IntoPath,
+        T: openusd::sdf::IntoPath,
+    >(
+        &self,
+        references: impl IntoIterator<Item = (D, &'a Self, T, openusd::sdf::LayerOffset)>,
+    ) -> anyhow::Result<Self> {
+        self.assemble_references(references, true)
+    }
+
+    fn assemble_references<'a, D: openusd::sdf::IntoPath, T: openusd::sdf::IntoPath>(
+        &self,
+        references: impl IntoIterator<Item = (D, &'a Self, T, openusd::sdf::LayerOffset)>,
+        instanceable: bool,
+    ) -> anyhow::Result<Self> {
+        let references = references
+            .into_iter()
+            .map(|(destination, source, target, offset)| {
+                Ok((
+                    openusd::sdf::try_into_path(destination)?,
+                    source,
+                    openusd::sdf::try_into_path(target)?,
+                    offset,
+                ))
+            })
+            .collect::<Result<Vec<_>, openusd::sdf::PathParseError>>()?;
+        if references.is_empty() {
+            return Ok(self.clone());
+        }
+        anyhow::ensure!(
+            self.identifier.ends_with(".usda"),
+            "reference assembly requires a .usda root identifier"
+        );
+        let mut combined = self.clone();
+        let mut sources = BTreeMap::new();
+        for (destination, dependency, target, offset) in &references {
+            anyhow::ensure!(
+                offset.is_valid() && offset.scale > 0.0,
+                "reference assembly requires a finite offset and positive finite scale"
+            );
+            for path in std::iter::once(destination).chain((!target.is_empty()).then_some(target)) {
+                anyhow::ensure!(
+                    path.as_str().starts_with('/')
+                        && path.as_str() != "/"
+                        && path.is_prim()
+                        && !path.has_variant_selection(),
+                    "reference assembly requires absolute non-root prim paths"
+                );
+            }
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                sources.entry(dependency.revision())
+            {
+                combined = combined.with_dependency(dependency)?;
+                entry.insert(dependency.open_stage()?);
+            }
+            let dependency_stage = &sources[&dependency.revision()];
+            if target.is_empty() {
+                anyhow::ensure!(
+                    dependency_stage.default_prim().is_some(),
+                    "reference source has no defaultPrim"
+                );
+            } else {
+                anyhow::ensure!(
+                    dependency_stage.prim(target)?.is_valid()?,
+                    "reference target does not exist: {target}"
+                );
+            }
+        }
+        let stage = combined.open_stage()?;
+        for (destination, dependency, target, layer_offset) in references {
+            anyhow::ensure!(
+                !stage.prim(&destination)?.is_valid()?,
+                "reference destination already exists: {destination}"
+            );
+            stage.define_prim(&destination)?;
+            crate::authoring::set_references(
+                &stage,
+                destination.as_str(),
+                &[openusd::sdf::Reference {
+                    asset_path: dependency.identifier.clone(),
+                    prim_path: target,
+                    layer_offset,
+                    ..Default::default()
+                }],
+            )?;
+            if instanceable {
+                stage.prim(&destination)?.set_instanceable(true)?;
+            }
+            anyhow::ensure!(
+                stage.prim(&destination)?.is_valid()?,
+                "reference destination did not compose"
+            );
+        }
+        Self::validate_composition(&stage)?;
+        combined.bytes = stage.root_layer().export_to_string()?.into_bytes().into();
+        combined.identity = NEXT_SOURCE.fetch_add(1, Ordering::Relaxed);
+        Ok(combined)
+    }
+
+    pub(crate) fn insert_dependency(&mut self, identifier: String, bytes: impl Into<Arc<[u8]>>) {
+        Arc::make_mut(&mut self.files).insert(identifier, bytes.into());
+        self.identity = NEXT_SOURCE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a dependency that cannot be read, so composition stops requesting it.
+    pub(crate) fn mark_absent(&mut self, identifier: String) {
+        Arc::make_mut(&mut self.absent).insert(identifier);
+        self.identity = NEXT_SOURCE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn replace_file_bytes(&mut self, identifier: String, bytes: impl Into<Arc<[u8]>>) {
+        if identifier == self.identifier {
+            self.bytes = bytes.into();
+            self.identity = NEXT_SOURCE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.insert_dependency(identifier, bytes);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe(&self) -> (Result<(), String>, BTreeSet<String>) {
+        let (result, missing) = self.probe_stage();
+        (result.map(|_| ()), missing)
+    }
+
+    /// Like `probe`, keeping the validated stage so a caller that needs it
+    /// next (texture requests, say) does not parse the source again.
+    pub(crate) fn probe_stage(&self) -> (Result<Stage, String>, BTreeSet<String>) {
+        self.probe_with(false, None)
+    }
+
+    /// One dependency discovery round: like `probe_stage`, but validation
+    /// stops once the traversal has requested a missing layer, since the
+    /// caller reopens the stage after loading it. With `fetch`, missing files
+    /// are read as composition asks for them instead of being requested.
+    pub(crate) fn probe_round(
+        &self,
+        fetch: Option<Fetcher>,
+    ) -> (Result<Stage, String>, BTreeSet<String>) {
+        self.probe_with(true, fetch)
+    }
+
+    fn probe_with(
+        &self,
+        stop_at_missing: bool,
+        fetch: Option<Fetcher>,
+    ) -> (Result<Stage, String>, BTreeSet<String>) {
+        let requests = Arc::new(Mutex::new(BTreeSet::new()));
+        let result = (|| -> anyhow::Result<Stage> {
+            let stage = self.open_tracked(requests.clone(), fetch, false)?;
+            Self::validate_until(&stage, || {
+                stop_at_missing && !requests.lock().expect("dependency requests").is_empty()
+            })?;
+            Ok(stage)
+        })()
+        .map_err(|error| error.to_string());
+        let missing = std::mem::take(&mut *requests.lock().expect("dependency requests"));
+        if result.is_ok() && missing.is_empty() {
+            self.record_default_validation();
+        }
+        (result, missing)
+    }
+
+    /// Open an independent stage from this snapshot.
+    pub fn open_stage(&self) -> openusd::Result<Stage> {
+        self.open_tracked(Arc::default(), None, false)
+    }
+
+    /// Open an independent stage from this snapshot with every payload
+    /// unloaded, for streaming to load as it needs.
+    pub fn open_stage_unloaded(&self) -> openusd::Result<Stage> {
+        self.open_tracked(Arc::default(), None, true)
+    }
+
+    pub(crate) fn open_stage_for_editor(&self) -> openusd::Result<(Stage, DiskBaselines)> {
+        let baselines = DiskBaselines::default();
+        let stage = Stage::builder()
+            .schema_registry(openusd_schemas::schema_registry())
+            .resolver(SourceResolver {
+                source: self.clone(),
+                fallback: DefaultResolver::new(),
+                requests: Arc::default(),
+                disk_baselines: self.filesystem.then_some(baselines.clone()),
+                fetch: None,
+            })
+            .open(&self.identifier)?;
+        Ok((stage, baselines))
+    }
+
+    pub(crate) fn validate_composition(stage: &Stage) -> anyhow::Result<()> {
+        Self::validate_until(stage, || false)
+    }
+
+    /// `validate_composition` that returns early, unvalidated, when `missing`
+    /// holds after the traversal.
+    fn validate_until(stage: &Stage, missing: impl Fn() -> bool) -> anyhow::Result<()> {
+        let profile_values = std::env::var_os("USD_PROFILE_VALIDATION_VALUES").is_some();
+        let mut value_times = [std::time::Duration::ZERO; 3];
+        let started = (std::env::var_os("USD_PROFILE_LOADING").is_some())
+            .then(bevy::platform::time::Instant::now);
+        let report = |phase: &str, prims: usize, attributes: usize| {
+            if let Some(started) = started {
+                eprintln!(
+                    "validation_profile phase={phase} elapsed_ms={:.3} prims={prims} attributes={attributes}",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        };
+        report("traverse-start", 0, 0);
+        let mut paths = Vec::new();
+        stage.traverse(openusd::usd::PrimPredicate::DEFAULT_PROXIES, |path| {
+            paths.push(path.clone())
+        })?;
+        let prim_count = paths.len();
+        let mut attribute_count = 0;
+        report("traverse-complete", prim_count, 0);
+        if missing() {
+            return Ok(());
+        }
+        let mut clip_prims = std::collections::HashSet::new();
+        for (index, path) in paths.into_iter().enumerate() {
+            let prim = stage.prim(&path)?;
+            let has_clips = path
+                .parent()
+                .is_some_and(|parent| clip_prims.contains(&parent))
+                || prim.metadata::<openusd::vt::Value>("clips")?.is_some();
+            if has_clips {
+                clip_prims.insert(path.clone());
+            }
+            if let Some(openusd::vt::Value::ReferenceListOp(references)) =
+                prim.metadata("references")?
+            {
+                for reference in references
+                    .explicit_items()
+                    .iter()
+                    .chain(references.prepended_items())
+                    .chain(references.appended_items())
+                    .chain(references.added_items())
+                {
+                    anyhow::ensure!(
+                        reference.layer_offset.is_valid_composition(),
+                        "unsupported reference time offset at {path}: {:?}",
+                        reference.layer_offset
+                    );
+                }
+            }
+            if let Some(openusd::vt::Value::PayloadListOp(payloads)) = prim.metadata("payload")? {
+                for payload in payloads
+                    .explicit_items()
+                    .iter()
+                    .chain(payloads.prepended_items())
+                    .chain(payloads.appended_items())
+                    .chain(payloads.added_items())
+                {
+                    anyhow::ensure!(
+                        payload.layer_offset.is_valid_composition(),
+                        "unsupported payload time offset at {path}: {:?}",
+                        payload.layer_offset
+                    );
+                }
+            }
+            let attributes = if has_clips {
+                prim.attributes()?
+            } else {
+                prim.authored_attributes()?
+            };
+            for attribute in attributes {
+                attribute_count += 1;
+                let type_started = profile_values.then(bevy::platform::time::Instant::now);
+                let asset = attribute
+                    .type_name()?
+                    .is_some_and(|name| matches!(name.as_str(), "asset" | "asset[]"));
+                if let Some(started) = type_started {
+                    value_times[1] += started.elapsed();
+                }
+                // Only asset values and clip-backed values can request files.
+                if !asset && !has_clips {
+                    continue;
+                }
+                let value_started = profile_values.then(bevy::platform::time::Instant::now);
+                attribute.get::<openusd::vt::Value>()?;
+                if let Some(started) = value_started {
+                    value_times[0] += started.elapsed();
+                }
+                let samples_started = profile_values.then(bevy::platform::time::Instant::now);
+                if asset {
+                    for time in attribute.time_sample_times()? {
+                        attribute.get_at::<openusd::vt::Value>(Some(
+                            openusd::usd::TimeCode::new(time),
+                        ))?;
+                    }
+                } else {
+                    attribute.num_time_samples()?;
+                }
+                if let Some(started) = samples_started {
+                    value_times[2] += started.elapsed();
+                }
+            }
+            if started.is_some() && (index + 1) % 4096 == 0 {
+                report("attribute-progress", index + 1, attribute_count);
+            }
+        }
+        report("attributes-complete", prim_count, attribute_count);
+        if profile_values {
+            eprintln!(
+                "validation_value_profile attributes={attribute_count} default_ms={:.3} type_ms={:.3} samples_ms={:.3} scope=attribute-get-type-and-samples excludes=enumeration,prim-metadata,traversal includes=per-attribute-timer-overhead",
+                value_times[0].as_secs_f64() * 1000.0,
+                value_times[1].as_secs_f64() * 1000.0,
+                value_times[2].as_secs_f64() * 1000.0
+            );
+        }
+        for identifier in stage.layer_identifiers() {
+            if stage.is_layer_muted(&identifier) {
+                continue;
+            }
+            let Some(layer) = stage.layer(&identifier) else {
+                continue;
+            };
+            let Some(root) = layer.pseudo_root() else {
+                continue;
+            };
+            let sublayers = root.sublayers().unwrap_or_default();
+            let offsets = root
+                .get::<Vec<openusd::sdf::LayerOffset>>(openusd::sdf::FieldKey::SubLayerOffsets)
+                .unwrap_or_default();
+            for (index, offset) in offsets.iter().take(sublayers.len()).enumerate() {
+                anyhow::ensure!(
+                    offset.is_valid_composition(),
+                    "unsupported sublayer time offset in {identifier} at index {index}: {offset:?}"
+                );
+            }
+        }
+        let errors = stage.composition_errors();
+        anyhow::ensure!(
+            errors.is_empty(),
+            "USD composition failed: {}",
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        report("complete", prim_count, attribute_count);
+        Ok(())
+    }
+
+    fn open_tracked(
+        &self,
+        requests: Arc<Mutex<BTreeSet<String>>>,
+        fetch: Option<Fetcher>,
+        unloaded: bool,
+    ) -> openusd::Result<Stage> {
+        let load = if unloaded {
+            openusd::usd::InitialLoadSet::LoadNone
+        } else {
+            openusd::usd::InitialLoadSet::LoadAll
+        };
+        Stage::builder()
+            .schema_registry(openusd_schemas::schema_registry())
+            .resolver(SourceResolver {
+                source: self.clone(),
+                fallback: DefaultResolver::new(),
+                requests,
+                disk_baselines: None,
+                fetch: fetch.or_else(|| self.fetch.clone()),
+            })
+            .load(load)
+            .open(&self.identifier)
+    }
+
+    /// Keeps `fetch` for every stage opened from this source, so a payload
+    /// loaded later can read files the snapshot lacks.
+    pub(crate) fn set_fetch(&mut self, fetch: Fetcher) {
+        self.fetch = Some(fetch);
+    }
+}
+
+struct SourceResolver {
+    source: UsdSource,
+    fallback: DefaultResolver,
+    requests: Arc<Mutex<BTreeSet<String>>>,
+    disk_baselines: Option<DiskBaselines>,
+    fetch: Option<Fetcher>,
+}
+
+pub(crate) struct SharedAsset(pub(crate) Cursor<Arc<[u8]>>);
+
+pub(crate) fn read_file_snapshot(path: &Path) -> io::Result<Arc<[u8]>> {
+    read_shared_asset(&mut std::fs::File::open(path)?)
+}
+
+pub(crate) fn file_hash(path: &Path) -> io::Result<blake3::Hash> {
+    let mut hash = blake3::Hasher::new();
+    hash.update_reader(std::fs::File::open(path)?)?;
+    Ok(hash.finalize())
+}
+
+/// Ptex textures resolve by name but are never captured: nothing reads their
+/// texels, and a production set can hold gigabytes of them. A UDIM pattern
+/// names no file; the tiles of the sets bound materials read are fetched apart.
+fn uncaptured(path: &str) -> bool {
+    path.contains(UDIM)
+        || Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "ptx" | "ptex")
+            })
+}
+
+/// Reads the entry `inner` names in `package`, one nested package at a time.
+pub(crate) fn package_entry(package: Arc<[u8]>, inner: &str) -> io::Result<AssetBuffer> {
+    let mut buffer = AssetBuffer::from(package);
+    let mut remaining = inner.to_owned();
+    loop {
+        let (name, rest) = match openusd::ar::split_package_relative_path_outer(&remaining) {
+            Some((name, rest)) => (name, Some(rest)),
+            None => (std::mem::take(&mut remaining), None),
+        };
+        buffer = openusd::usdz::Archive::from_bytes(buffer)
+            .and_then(|mut archive| archive.entry(&name))
+            .map_err(io::Error::other)?;
+        match rest {
+            Some(rest) => remaining = rest,
+            None => return Ok(buffer),
+        }
+    }
+}
+
+fn read_shared_asset(asset: &mut dyn Asset) -> io::Result<Arc<[u8]>> {
+    if let Some(view) = asset.shared_buffer() {
+        return Ok(Arc::from(&*view));
+    }
+    asset.seek(SeekFrom::Start(0))?;
+    let size = usize::try_from(asset.size()?)
+        .ok()
+        .filter(|size| *size <= isize::MAX as usize)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "asset snapshot size exceeds addressable memory",
+            )
+        })?;
+    let mut bytes: Arc<[u8]> = std::iter::repeat_n(0, size).collect();
+    let buffer = Arc::get_mut(&mut bytes).expect("unshared snapshot buffer");
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match asset.read(&mut buffer[filled..]) {
+            Ok(0) => return Ok(Arc::from(&buffer[..filled])),
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let mut tail = Vec::new();
+    asset.read_to_end(&mut tail)?;
+    if tail.is_empty() {
+        Ok(bytes)
+    } else {
+        Ok(bytes.iter().copied().chain(tail).collect())
+    }
+}
+
+impl Read for SharedAsset {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl Seek for SharedAsset {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.0.seek(position)
+    }
+}
+
+impl Asset for SharedAsset {
+    fn size(&self) -> io::Result<u64> {
+        Ok(self.0.get_ref().len() as u64)
+    }
+    fn shared_buffer(&self) -> Option<SharedBuffer> {
+        Some(SharedBuffer::new(self.0.get_ref().clone()))
+    }
+}
+
+impl SourceResolver {
+    fn bytes(&self, identifier: &str) -> Option<Arc<[u8]>> {
+        if let Some(bytes) = self.disk_baselines.as_ref().and_then(|disk| {
+            disk.replacements
+                .lock()
+                .expect("editor source replacements")
+                .get(identifier)
+                .cloned()
+        }) {
+            return Some(bytes);
+        }
+        if identifier == self.source.identifier {
+            Some(self.source.bytes.clone())
+        } else {
+            self.source.files.get(identifier).cloned().or_else(|| {
+                self.fetch
+                    .as_ref()
+                    .and_then(|fetch| fetch.peek(identifier).flatten())
+            })
+        }
+    }
+
+    fn contains_packaged_path(&self, path: &str) -> bool {
+        let Some((package, inner)) = openusd::ar::split_package_relative_path_outer(path) else {
+            return false;
+        };
+        let Some(bytes) = self.bytes(&package) else {
+            return false;
+        };
+        zip::ZipArchive::new(Cursor::new(bytes.as_ref()))
+            .map(|mut archive| {
+                let entry = openusd::ar::split_package_relative_path_outer(&inner)
+                    .map(|(package, _)| package)
+                    .unwrap_or(inner);
+                archive.by_name(&entry).is_ok()
+            })
+            .unwrap_or(false)
+    }
+
+    fn packaged_bytes(&self, path: &str) -> io::Result<Option<AssetBuffer>> {
+        let Some((package, inner)) = openusd::ar::split_package_relative_path_outer(path) else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.bytes(&package) else {
+            return Ok(None);
+        };
+        package_entry(bytes, &inner).map(Some)
+    }
+}
+
+impl Resolver for SourceResolver {
+    fn create_identifier(&self, path: &str, anchor: Option<&ResolvedPath>) -> String {
+        // A UDIM pattern names no file for a search to find, so it is anchored.
+        if (!self.source.filesystem || path.contains(UDIM))
+            && !openusd::ar::is_package_relative_path(path)
+            && !rooted(Path::new(path))
+            && let Some(anchor) = anchor
+            && !openusd::ar::is_package_relative_path(&anchor.to_string_lossy())
+            && !anchor.to_string_lossy().ends_with(".usdz")
+        {
+            return normalize(&anchor.parent().unwrap_or(Path::new("/")).join(path))
+                .to_string_lossy()
+                .into_owned();
+        }
+        self.fallback.create_identifier(path, anchor)
+    }
+
+    fn resolve(&self, path: &str) -> Option<ResolvedPath> {
+        if self.bytes(path).is_some() {
+            Some(ResolvedPath::new(PathBuf::from(path)))
+        } else if self.contains_packaged_path(path) {
+            Some(ResolvedPath::new(PathBuf::from(path)))
+        } else if uncaptured(path) {
+            Some(ResolvedPath::new(PathBuf::from(path)))
+        } else if self.source.filesystem {
+            self.fallback.resolve(path)
+        } else {
+            let dependency = openusd::ar::split_package_relative_path_outer(path)
+                .map(|(package, _)| package)
+                .unwrap_or_else(|| path.to_string());
+            let request = if self.bytes(&dependency).is_some() {
+                path.to_string()
+            } else {
+                dependency
+            };
+            if self.source.absent.contains(&request) {
+                return None;
+            }
+            if let Some(fetch) = self
+                .fetch
+                .as_ref()
+                .filter(|_| !openusd::ar::is_package_relative_path(&request))
+            {
+                return fetch.get(&request).and_then(|_| self.resolve(path));
+            }
+            self.requests
+                .lock()
+                .expect("dependency requests")
+                .insert(request);
+            None
+        }
+    }
+
+    fn resolve_for_new_asset(&self, path: &str) -> Option<ResolvedPath> {
+        if self.source.filesystem {
+            self.resolve(path)
+                .or_else(|| self.fallback.resolve_for_new_asset(path))
+        } else {
+            Some(ResolvedPath::new(PathBuf::from(path)))
+        }
+    }
+
+    fn open_asset(&self, path: &ResolvedPath) -> io::Result<Box<dyn Asset>> {
+        if let Some(baselines) = &self.disk_baselines {
+            let identifier = path.to_string_lossy();
+            let packaged = openusd::ar::split_package_relative_path_outer(&identifier);
+            let outer = packaged
+                .as_ref()
+                .map_or(identifier.as_ref(), |(outer, _)| outer.as_str());
+            let bytes: Arc<[u8]> = if let Some(bytes) = self.bytes(outer) {
+                bytes.clone()
+            } else if self.source.filesystem {
+                read_shared_asset(
+                    self.fallback
+                        .open_asset(&ResolvedPath::new(outer))?
+                        .as_mut(),
+                )?
+            } else {
+                return Err(io::Error::new(io::ErrorKind::NotFound, outer.to_owned()));
+            };
+            let key = crate::persistence::destination_identity(Path::new(outer))?;
+            baselines
+                .lock()
+                .expect("disk baselines")
+                .entry(key)
+                .or_insert_with(|| blake3::hash(&bytes));
+            baselines
+                .snapshots
+                .lock()
+                .expect("editor read snapshots")
+                .entry(outer.to_owned())
+                .or_insert_with(|| bytes.clone());
+            return if let Some((_, inner)) = packaged {
+                package_entry(bytes, &inner)
+                    .map(|buffer| Box::new(Cursor::new(buffer)) as Box<dyn Asset>)
+            } else {
+                Ok(Box::new(SharedAsset(Cursor::new(bytes))))
+            };
+        }
+        if let Some(bytes) = self.bytes(&path.to_string_lossy()) {
+            Ok(Box::new(SharedAsset(Cursor::new(bytes))))
+        } else if let Some(bytes) = self.packaged_bytes(&path.to_string_lossy())? {
+            Ok(Box::new(Cursor::new(bytes)))
+        } else if self.source.filesystem {
+            self.fallback.open_asset(path)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                path.to_string_lossy().into_owned(),
+            ))
+        }
+    }
+
+    fn identity(&self) -> String {
+        format!(
+            "usd-bevy-source:{}:{}",
+            self.source.identity, self.source.identifier
+        )
+    }
+}
+
+/// `Path::is_absolute`, also true for `/`-rooted paths on wasm32, where std
+/// considers no path absolute.
+pub(crate) fn rooted(path: &Path) -> bool {
+    path.is_absolute() || (cfg!(target_arch = "wasm32") && path.has_root())
+}
+
+/// Anchors a relative path at the working directory, or at `/` on wasm32.
+pub(crate) fn absolute(path: &Path) -> io::Result<PathBuf> {
+    if rooted(path) {
+        return Ok(path.to_path_buf());
+    }
+    #[cfg(target_arch = "wasm32")]
+    return Ok(Path::new("/").join(path));
+    #[cfg(not(target_arch = "wasm32"))]
+    Ok(std::env::current_dir()?.join(path))
+}
+
+fn normalize(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            component => result.push(component.as_os_str()),
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn source_replacements_share_snapshots_without_mutating_previous_sources() {
+        use super::*;
+        let mut source =
+            UsdSource::new("shared-replacement/root.usda", b"original".as_slice()).unwrap();
+        let before = source.clone();
+        let root: Arc<[u8]> = Arc::from(b"replacement".as_slice());
+        let child: Arc<[u8]> = Arc::from(b"child".as_slice());
+        source.replace_file_bytes(source.identifier().to_owned(), root.clone());
+        source.replace_file_bytes("child.usda".into(), child.clone());
+        assert!(Arc::ptr_eq(&source.bytes, &root));
+        assert!(Arc::ptr_eq(&source.files["child.usda"], &child));
+        assert_eq!(before.bytes.as_ref(), b"original");
+        assert!(before.files.is_empty());
+        assert_ne!(source.revision(), before.revision());
+        let snapshot = source.clone();
+        source.replace_file_bytes("child.usda".into(), b"next".to_vec());
+        assert!(Arc::ptr_eq(&snapshot.files["child.usda"], &child));
+        assert_eq!(source.files["child.usda"].as_ref(), b"next");
+    }
+
+    #[test]
+    fn shared_reads_handle_size_changes_interrupts_and_failures() {
+        use super::*;
+        struct SizedAsset {
+            data: Cursor<Vec<u8>>,
+            hint: u64,
+            interrupted: bool,
+            fail: bool,
+        }
+        impl Read for SizedAsset {
+            fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                if self.fail && self.data.position() >= 3 {
+                    return Err(io::ErrorKind::Other.into());
+                }
+                let count = target.len().min(3);
+                self.data.read(&mut target[..count])
+            }
+        }
+        impl Seek for SizedAsset {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.data.seek(position)
+            }
+        }
+        impl Asset for SizedAsset {
+            fn size(&self) -> io::Result<u64> {
+                Ok(self.hint)
+            }
+        }
+        for data in [vec![], vec![1], (0..32).collect()] {
+            for hint in [0, 1, 4, data.len() as u64, 64] {
+                let mut asset = SizedAsset {
+                    data: Cursor::new(data.clone()),
+                    hint,
+                    interrupted: false,
+                    fail: false,
+                };
+                assert_eq!(read_shared_asset(&mut asset).unwrap().as_ref(), data);
+            }
+        }
+        for hint in [0, 4, 32] {
+            let mut asset = SizedAsset {
+                data: Cursor::new(vec![1; 32]),
+                hint,
+                interrupted: false,
+                fail: true,
+            };
+            assert_eq!(
+                read_shared_asset(&mut asset).unwrap_err().kind(),
+                io::ErrorKind::Other
+            );
+        }
+        let mut invalid = SizedAsset {
+            data: Cursor::new(vec![]),
+            hint: u64::MAX,
+            interrupted: false,
+            fail: false,
+        };
+        assert_eq!(
+            read_shared_asset(&mut invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let bytes: Arc<[u8]> = Arc::from([1, 2, 3]);
+        let mut shared = SharedAsset(Cursor::new(bytes.clone()));
+        shared.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(read_shared_asset(&mut shared).unwrap(), bytes);
+    }
+
+    #[test]
+    fn file_sources_keep_immutable_root_snapshots() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("root.usda");
+        assert_eq!(
+            UsdSource::from_file(&path).err().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        std::fs::write(&path, b"#usda 1.0\ndef Xform \"Original\" {}\n").unwrap();
+        let original = UsdSource::from_file(&path).unwrap();
+        std::fs::write(&path, b"#usda 1.0\ndef Xform \"Replacement\" {}\n").unwrap();
+        let replacement = UsdSource::from_file(&path).unwrap();
+        assert!(
+            original
+                .open_stage()
+                .unwrap()
+                .prim("/Original")
+                .unwrap()
+                .is_valid()
+                .unwrap()
+        );
+        assert!(
+            !original
+                .open_stage()
+                .unwrap()
+                .prim("/Replacement")
+                .unwrap()
+                .is_valid()
+                .unwrap()
+        );
+        assert!(
+            replacement
+                .open_stage()
+                .unwrap()
+                .prim("/Replacement")
+                .unwrap()
+                .is_valid()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn binary_snapshots_share_bytes_and_keep_edits_isolated() {
+        use super::*;
+        use openusd::{
+            sdf::{FileFormat, LayerRegistry},
+            vt::Value,
+        };
+        let text = b"#usda 1.0\ndef Xform \"Root\" { double value = 2 }";
+        let data = LayerRegistry::read_bytes(text.as_slice().into(), "source.usda")
+            .unwrap()
+            .0;
+        let mut output = Cursor::new(Vec::new());
+        openusd::usdc::UsdcFileFormat
+            .write(data.as_ref(), &mut output)
+            .unwrap();
+        let bytes: Arc<[u8]> = output.into_inner().into();
+        let digest = blake3::hash(&bytes);
+        let mut asset = SharedAsset(Cursor::new(bytes.clone()));
+        asset.seek(SeekFrom::End(0)).unwrap();
+        let snapshot = asset.shared_buffer().unwrap();
+        assert_eq!(snapshot.as_ptr(), bytes.as_ptr());
+        let owners = Arc::strong_count(&bytes);
+        let mut first = LayerRegistry::read_bytes(snapshot.into(), "first.usd")
+            .unwrap()
+            .0;
+        assert_eq!(Arc::strong_count(&bytes), owners);
+        let second = openusd::usdc::UsdcFileFormat
+            .read_bytes(bytes.clone().into(), "second.usdc")
+            .unwrap();
+        let path = openusd::sdf::path("/Root.value").unwrap();
+        first.set_field(&path, "default", Value::Double(7.0));
+        assert_eq!(
+            first.field(&path, "default").unwrap().into_owned(),
+            Value::Double(7.0)
+        );
+        assert_eq!(
+            second.field(&path, "default").unwrap().into_owned(),
+            Value::Double(2.0)
+        );
+        assert_eq!(blake3::hash(&bytes), digest);
+        drop((first, second, asset));
+        assert_eq!(Arc::strong_count(&bytes), 1);
+        for name in ["shared.usd", "shared.usdc"] {
+            let source = UsdSource::snapshot(name, bytes.as_ref().to_vec()).unwrap();
+            let first = source.open_stage().unwrap();
+            assert!(Arc::strong_count(&source.bytes) >= 3);
+            first
+                .attribute("/Root.value")
+                .unwrap()
+                .set(Value::Double(9.0))
+                .unwrap();
+            let second = source.open_stage().unwrap();
+            assert_eq!(
+                second
+                    .attribute("/Root.value")
+                    .unwrap()
+                    .get::<f64>()
+                    .unwrap(),
+                Some(2.0)
+            );
+        }
+        let text: Arc<[u8]> = Arc::from(text.as_slice());
+        assert!(
+            LayerRegistry::read_bytes(text.into(), "text.usd")
+                .unwrap()
+                .0
+                .has_spec(&openusd::sdf::path("/Root").unwrap())
+        );
+        assert!(
+            LayerRegistry::read_bytes(
+                Arc::<[u8]>::from(b"PXR-USDC".as_slice()).into(),
+                "broken.usd"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn property_classification_preserves_schemas_masks_and_edits() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("properties.usda");
+        std::fs::write(
+            &file,
+            br#"#usda 1.0
+def Sphere "Shape" { double customValue = 1 rel link = </Shape> }
+def "Instance" (instanceable = true prepend references = </Shape>) {}
+"#,
+        )
+        .unwrap();
+        for masked in [false, true] {
+            let mask = if masked {
+                openusd::usd::StagePopulationMask::new(["/Shape"]).unwrap()
+            } else {
+                openusd::usd::StagePopulationMask::all()
+            };
+            let stage = Stage::builder()
+                .schema_registry(openusd_schemas::schema_registry())
+                .mask(mask)
+                .open(file.to_str().unwrap())
+                .unwrap();
+            let shape = stage.prim("/Shape").unwrap();
+            assert_eq!(
+                shape
+                    .authored_attributes()
+                    .unwrap()
+                    .iter()
+                    .map(|attr| attr.path().to_string())
+                    .collect::<Vec<_>>(),
+                ["/Shape.customValue"]
+            );
+            assert_eq!(shape.authored_relationships().unwrap().len(), 1);
+            assert!(
+                shape
+                    .attributes()
+                    .unwrap()
+                    .iter()
+                    .any(|attr| attr.path().as_str() == "/Shape.radius")
+            );
+            assert!(
+                stage
+                    .prim("/Absent")
+                    .unwrap()
+                    .attributes()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                stage
+                    .prim("/Instance")
+                    .unwrap()
+                    .authored_attributes()
+                    .unwrap()
+                    .len(),
+                usize::from(!masked)
+            );
+            shape.create_attribute("added", "float").unwrap();
+            assert_eq!(shape.authored_attributes().unwrap().len(), 2);
+            stage.remove_property("/Shape.link").unwrap();
+            shape.create_attribute("link", "double").unwrap();
+            assert!(shape.authored_relationships().unwrap().is_empty());
+            assert_eq!(shape.authored_attributes().unwrap().len(), 3);
+            assert_eq!(
+                stage
+                    .prim("/Instance")
+                    .unwrap()
+                    .authored_attributes()
+                    .unwrap()
+                    .len(),
+                if masked { 0 } else { 3 }
+            );
+        }
+    }
+
+    #[test]
+    fn default_traversal_matches_uncached_walk_during_visitor_edits() {
+        use super::*;
+        use openusd::usd::PrimPredicate;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("payload.usda"),
+            b"#usda 1.0\ndef \"Model\" { def \"Child\" {} }\n",
+        )
+        .unwrap();
+        let file = directory.path().join("traversal.usda");
+        std::fs::write(
+            &file,
+            br#"#usda 1.0
+def "Root" {
+    def "A" { def "Leaf" {} }
+    def "B" { def "Leaf" {} }
+    def "Model" { def "Child" { def "Leaf" {} } }
+    def "Instance" (instanceable = true prepend references = </Root/Model>) {}
+    def "Payload" (prepend payload = @payload.usda@</Model>) {}
+    class "Abstract" { def "Child" {} }
+    over "Undefined" { def "Child" {} }
+}
+"#,
+        )
+        .unwrap();
+        for masked in [false, true] {
+            for initially_loaded in [true, false] {
+                for edit in 0..9 {
+                    let mut results = Vec::new();
+                    for optimized in [false, true] {
+                        let mask = if masked {
+                            openusd::usd::StagePopulationMask::new([
+                                "/Root/A",
+                                "/Root/B/Leaf",
+                                "/Root/Model",
+                                "/Root/Instance",
+                                "/Root/Payload",
+                            ])
+                            .unwrap()
+                        } else {
+                            openusd::usd::StagePopulationMask::all()
+                        };
+                        let stage = Stage::builder()
+                            .mask(mask)
+                            .open(file.to_str().unwrap())
+                            .unwrap();
+                        if !initially_loaded {
+                            stage.set_load_rules(openusd::pcp::LoadRules::none());
+                        }
+                        let mut visited = Vec::new();
+                        let mut visit = |path: &openusd::sdf::Path| {
+                            visited.push(path.clone());
+                            if path.as_str() != "/Root/A" {
+                                return;
+                            }
+                            match edit {
+                                1 => {
+                                    stage.prim("/Root").unwrap().set_active(false).unwrap();
+                                }
+                                2 => {
+                                    stage
+                                        .prim("/Root")
+                                        .unwrap()
+                                        .set_metadata("specifier", openusd::sdf::Specifier::Class)
+                                        .unwrap();
+                                }
+                                3 => {
+                                    stage.prim("/Root/B").unwrap().set_active(false).unwrap();
+                                }
+                                4 => stage.set_load_rules(openusd::pcp::LoadRules::none()),
+                                5 => {
+                                    stage
+                                        .prim("/Root/Model")
+                                        .unwrap()
+                                        .set_active(false)
+                                        .unwrap();
+                                }
+                                6 => {
+                                    stage
+                                        .prim("/Root")
+                                        .unwrap()
+                                        .set_metadata("specifier", openusd::sdf::Specifier::Over)
+                                        .unwrap();
+                                }
+                                7 => {
+                                    stage.define_prim("/Root/B/New").unwrap();
+                                }
+                                8 => stage.set_load_rules(openusd::pcp::LoadRules::all()),
+                                _ => {}
+                            }
+                        };
+                        if optimized {
+                            stage
+                                .traverse(PrimPredicate::DEFAULT_PROXIES, &mut visit)
+                                .unwrap();
+                        } else {
+                            let mut stack = vec![openusd::sdf::Path::abs_root()];
+                            while let Some(path) = stack.pop() {
+                                let prim = stage.prim(&path).unwrap();
+                                if !path.is_abs_root() {
+                                    let active = prim.is_active().unwrap();
+                                    let loaded = prim.is_loaded().unwrap();
+                                    let defined = prim.is_defined().unwrap();
+                                    let abstract_ = prim.is_abstract().unwrap();
+                                    if !(active && loaded && defined && !abstract_) {
+                                        continue;
+                                    }
+                                    visit(&path);
+                                }
+                                stack.extend(
+                                    prim.children()
+                                        .unwrap()
+                                        .into_iter()
+                                        .rev()
+                                        .map(|child| child.path().clone()),
+                                );
+                            }
+                        }
+                        results.push(visited);
+                    }
+                    assert_eq!(
+                        results[0], results[1],
+                        "masked={masked}, loaded={initially_loaded}, edit={edit}"
+                    );
+                    assert_eq!(results[0].first().unwrap().as_str(), "/Root");
+                    if edit == 0 {
+                        assert!(
+                            results[0]
+                                .iter()
+                                .any(|path| path.as_str() == "/Root/Instance/Child/Leaf")
+                        );
+                        assert_eq!(
+                            results[0]
+                                .iter()
+                                .any(|path| path.as_str() == "/Root/Payload/Child"),
+                            initially_loaded
+                        );
+                        assert!(
+                            !results[0]
+                                .iter()
+                                .any(|path| path.as_str().contains("Abstract")
+                                    || path.as_str().contains("Undefined"))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn abstract_ancestry_matches_field_queries_and_live_edits() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("classes.usda");
+        std::fs::write(
+            &file,
+            br#"#usda 1.0
+class "Abstract" { def Xform "Child" { def Xform "Leaf" {} } }
+def Xform "Model" { def Xform "Child" {} }
+def Xform "Instance" (instanceable = true prepend references = </Model>) {}
+over "Undefined" { def Xform "Child" {} }
+"#,
+        )
+        .unwrap();
+        for mask in [
+            openusd::usd::StagePopulationMask::all(),
+            openusd::usd::StagePopulationMask::new(["/Abstract/Child"]).unwrap(),
+        ] {
+            let stage = Stage::builder()
+                .mask(mask)
+                .open(file.to_str().unwrap())
+                .unwrap();
+            let check = || {
+                for name in [
+                    "/",
+                    "/Abstract",
+                    "/Abstract/Child",
+                    "/Abstract/Child/Leaf",
+                    "/Abstract/Missing",
+                    "/Model/Child",
+                    "/Instance/Child",
+                    "/Undefined/Child",
+                ] {
+                    let path = openusd::sdf::path(name).unwrap();
+                    let prim = stage.prim(&path).unwrap();
+                    let expected = !path.is_abs_root()
+                        && prim.is_valid().unwrap()
+                        && path.ancestors_below_root().any(|ancestor| {
+                            stage
+                                .field::<openusd::sdf::Specifier>(&ancestor, "specifier")
+                                .unwrap()
+                                == Some(openusd::sdf::Specifier::Class)
+                        });
+                    assert_eq!(prim.is_abstract().unwrap(), expected, "{name}");
+                    let status = stage.prim_status(&path).unwrap();
+                    assert_eq!(
+                        status.contains(openusd::usd::PrimStatus::ABSTRACT),
+                        expected,
+                        "{name}"
+                    );
+                    assert_eq!(
+                        status.contains(openusd::usd::PrimStatus::DEFINED),
+                        prim.is_defined().unwrap(),
+                        "{name}"
+                    );
+                }
+            };
+            check();
+            assert!(
+                stage
+                    .prim("/Abstract/Child")
+                    .unwrap()
+                    .is_abstract()
+                    .unwrap()
+            );
+            stage
+                .prim("/Abstract")
+                .unwrap()
+                .set_specifier(openusd::sdf::Specifier::Def)
+                .unwrap();
+            check();
+            assert!(
+                !stage
+                    .prim("/Abstract/Child")
+                    .unwrap()
+                    .is_abstract()
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn traversal_loaded_status_matches_direct_queries_after_edits() {
+        use super::*;
+        use openusd::usd::{PrimPredicate, PrimStatus};
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("payload.usda"),
+            b"#usda 1.0\ndef Xform \"Model\" { def Xform \"Child\" {} }\n",
+        )
+        .unwrap();
+        let source = UsdSource::new(
+            directory.path().join("root.usda"),
+            br#"#usda 1.0
+def Xform "Root" {
+    def Xform "Payload" (prepend payload = @payload.usda@</Model>) {}
+    def Xform "Ordinary" { def Xform "Child" {} }
+}
+"#
+            .as_slice(),
+        )
+        .unwrap();
+        let stage = source.open_stage().unwrap();
+        for loaded in [true, false, true] {
+            stage.set_load_rules(if loaded {
+                openusd::pcp::LoadRules::all()
+            } else {
+                openusd::pcp::LoadRules::none()
+            });
+            for active in [true, false, true] {
+                stage
+                    .prim("/Root/Ordinary")
+                    .unwrap()
+                    .set_active(active)
+                    .unwrap();
+                let mut all = Vec::new();
+                stage
+                    .traverse(PrimPredicate::ALL, |path| all.push(path.clone()))
+                    .unwrap();
+                let expected: Vec<_> = all
+                    .into_iter()
+                    .filter(|path| stage.prim(path).unwrap().is_loaded().unwrap())
+                    .collect();
+                for bits in [PrimStatus::LOADED, PrimStatus::ACTIVE | PrimStatus::LOADED] {
+                    let mut actual = Vec::new();
+                    stage
+                        .traverse(
+                            PrimPredicate::new(bits, PrimStatus::empty())
+                                .with_instance_proxies(true),
+                            |path| actual.push(path.clone()),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "loaded={loaded}, active={active}, bits={bits:?}"
+                    );
+                }
+                assert_eq!(
+                    stage.prim("/Root/Ordinary").unwrap().is_loaded().unwrap(),
+                    active
+                );
+                assert_eq!(
+                    stage.prim("/Root/Payload").unwrap().is_loaded().unwrap(),
+                    loaded
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stage_open_reuses_root_parses_without_retaining_stale_data() {
+        use super::*;
+        type Files = Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>;
+        type Counts = Arc<Mutex<std::collections::HashMap<String, usize>>>;
+        struct CountedResolver(Files, Counts);
+        impl Resolver for CountedResolver {
+            fn create_identifier(&self, path: &str, _: Option<&ResolvedPath>) -> String {
+                path.into()
+            }
+            fn resolve(&self, path: &str) -> Option<ResolvedPath> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .contains_key(path)
+                    .then(|| ResolvedPath::new(path))
+            }
+            fn resolve_for_new_asset(&self, path: &str) -> Option<ResolvedPath> {
+                self.resolve(path)
+            }
+            fn open_asset(&self, path: &ResolvedPath) -> io::Result<Box<dyn Asset>> {
+                let path = path.to_string_lossy().into_owned();
+                *self.1.lock().unwrap().entry(path.clone()).or_default() += 1;
+                Ok(Box::new(Cursor::new(
+                    self.0.lock().unwrap().get(&path).unwrap().clone(),
+                )))
+            }
+        }
+        let files: Files = Arc::new(Mutex::new(
+            [
+                (
+                    "root.usda",
+                    r#"#usda 1.0
+(
+    expressionVariables = { string WHICH = "a" string SHARED = "shared" }
+    subLayers = [@`"${WHICH}.usda"`@]
+)
+def Xform "Root" {}
+"#,
+                ),
+                (
+                    "session.usda",
+                    r#"#usda 1.0
+(
+    expressionVariables = { string WHICH = "b" }
+    subLayers = [@`"${SHARED}.usda"`@]
+)
+"#,
+                ),
+                ("a.usda", "#usda 1.0\ndef Xform \"A\" {}\n"),
+                ("b.usda", "#usda 1.0\ndef Xform \"B\" {}\n"),
+                ("shared.usda", "#usda 1.0\ndef Xform \"Shared\" {}\n"),
+            ]
+            .into_iter()
+            .map(|(path, text)| (path.into(), text.as_bytes().to_vec()))
+            .collect(),
+        ));
+        let counts: Counts = Default::default();
+        let open = |muted| {
+            let builder = Stage::builder()
+                .resolver(CountedResolver(files.clone(), counts.clone()))
+                .session_layer("session.usda");
+            if muted {
+                builder.mute(["session.usda"]).open("root.usda").unwrap()
+            } else {
+                builder.open("root.usda").unwrap()
+            }
+        };
+        let first = open(false);
+        assert!(first.prim("/B").unwrap().is_valid().unwrap());
+        assert!(first.prim("/Shared").unwrap().is_valid().unwrap());
+        assert!(!first.prim("/A").unwrap().is_valid().unwrap());
+        for path in ["root.usda", "session.usda", "b.usda", "shared.usda"] {
+            assert_eq!(counts.lock().unwrap().get(path), Some(&1), "{path}");
+        }
+        files.lock().unwrap().insert(
+            "b.usda".into(),
+            b"#usda 1.0\ndef Xform \"Updated\" {}\n".to_vec(),
+        );
+        let second = open(false);
+        assert!(second.prim("/Updated").unwrap().is_valid().unwrap());
+        assert!(first.prim("/B").unwrap().is_valid().unwrap());
+        second.define_prim("/OnlySecond").unwrap();
+        assert!(!first.prim("/OnlySecond").unwrap().is_valid().unwrap());
+        assert_eq!(counts.lock().unwrap().get("root.usda"), Some(&2));
+        assert_eq!(counts.lock().unwrap().get("session.usda"), Some(&2));
+        let muted = open(true);
+        assert!(muted.prim("/A").unwrap().is_valid().unwrap());
+        assert!(!muted.prim("/Shared").unwrap().is_valid().unwrap());
+    }
+
+    #[test]
+    fn package_root_lookup_reads_directory_without_copying_payload() {
+        use super::*;
+        use openusd::sdf::FileFormat;
+        use std::io::Write;
+        struct CountedAsset(Cursor<Arc<[u8]>>, Arc<AtomicU64>);
+        impl Read for CountedAsset {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = self.0.read(buffer)?;
+                self.1.fetch_add(count as u64, Ordering::Relaxed);
+                Ok(count)
+            }
+        }
+        impl Seek for CountedAsset {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.0.seek(position)
+            }
+        }
+        impl Asset for CountedAsset {
+            fn size(&self) -> io::Result<u64> {
+                Ok(self.0.get_ref().len() as u64)
+            }
+        }
+        struct CountedResolver(Arc<[u8]>, Arc<AtomicU64>);
+        impl Resolver for CountedResolver {
+            fn create_identifier(&self, path: &str, _: Option<&ResolvedPath>) -> String {
+                path.into()
+            }
+            fn resolve(&self, path: &str) -> Option<ResolvedPath> {
+                Some(ResolvedPath::new(path))
+            }
+            fn resolve_for_new_asset(&self, path: &str) -> Option<ResolvedPath> {
+                self.resolve(path)
+            }
+            fn open_asset(&self, _: &ResolvedPath) -> io::Result<Box<dyn Asset>> {
+                Ok(Box::new(CountedAsset(
+                    Cursor::new(self.0.clone()),
+                    self.1.clone(),
+                )))
+            }
+        }
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive.start_file("root.usda", options).unwrap();
+        archive.write_all(b"#usda 1.0\n").unwrap();
+        archive.start_file("payload.bin", options).unwrap();
+        archive.write_all(&vec![42; 4 * 1024 * 1024]).unwrap();
+        let bytes: Arc<[u8]> = archive.finish().unwrap().into_inner().into();
+        let read = Arc::new(AtomicU64::new(0));
+        let resolver = CountedResolver(bytes.clone(), read.clone());
+        let path = ResolvedPath::new("memory.usdz");
+        let resolved = openusd::usdz::UsdzFileFormat
+            .resolve_layer(&resolver, &path)
+            .unwrap();
+        assert_eq!(resolved.to_string(), "memory.usdz[root.usda]");
+        assert!(read.load(Ordering::Relaxed) < bytes.len() as u64 / 4);
+        let invalid = CountedResolver(Arc::from(b"not a zip".as_slice()), read);
+        assert_eq!(
+            openusd::usdz::UsdzFileFormat.resolve_layer(&invalid, &path),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn texture_manifest_reuse_requires_an_unchanged_default_snapshot() {
+        use super::*;
+        let bytes = b"#usda 1.0\ndef DomeLight \"Sky\" { asset inputs:texture:file = @sky.exr@ }\n";
+        let mut source = UsdSource::snapshot("textures.usda", bytes.as_slice()).unwrap();
+        let stage = source.open_stage().unwrap();
+        let first = source.texture_requests(&stage, true).unwrap();
+        assert_eq!(first.len(), 1);
+        let independent = source.clone().open_stage().unwrap();
+        assert!(Arc::ptr_eq(
+            &first,
+            &source.texture_requests(&independent, true).unwrap()
+        ));
+        stage
+            .attribute("/Sky.inputs:texture:file")
+            .unwrap()
+            .set(openusd::vt::Value::AssetPath(openusd::sdf::AssetPath::new(
+                "changed.exr",
+            )))
+            .unwrap();
+        let edited = source.texture_requests(&stage, false).unwrap();
+        assert_ne!(*first, *edited);
+        assert!(Arc::ptr_eq(
+            &first,
+            &source.texture_requests(&independent, true).unwrap()
+        ));
+        let dependency = UsdSource::snapshot("other.usda", b"#usda 1.0\n".as_slice()).unwrap();
+        let changed = source.with_dependency(&dependency).unwrap();
+        let second = changed
+            .texture_requests(&changed.open_stage().unwrap(), true)
+            .unwrap();
+        assert_eq!(*first, *second);
+        assert!(!Arc::ptr_eq(&first, &second));
+        source.replace_file_bytes(source.identifier().to_owned(), b"#usda 1.0\n".to_vec());
+        assert!(
+            source
+                .texture_requests(&source.open_stage().unwrap(), true)
+                .unwrap()
+                .is_empty()
+        );
+        let disk = UsdSource::new("textures.usda", bytes.as_slice()).unwrap();
+        let stage = disk.open_stage().unwrap();
+        let a = disk.texture_requests(&stage, true).unwrap();
+        let b = disk.texture_requests(&stage, true).unwrap();
+        assert_eq!(*a, *b);
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert!(disk.default_textures.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn default_validation_is_snapshot_and_revision_bound() {
+        let mut source =
+            super::UsdSource::snapshot("proof.usda", b"#usda 1.0\ndef Xform \"M\" {}\n".as_slice())
+                .unwrap();
+        assert!(!source.has_default_validation());
+        assert!(source.probe().0.is_ok());
+        assert!(source.clone().has_default_validation());
+        let dependency =
+            super::UsdSource::snapshot("other.usda", b"#usda 1.0\n".as_slice()).unwrap();
+        let changed = source.with_dependency(&dependency).unwrap();
+        assert!(!changed.has_default_validation());
+        assert!(source.has_default_validation());
+        source.replace_file_bytes(source.identifier().to_owned(), b"not valid USD".to_vec());
+        assert!(!source.has_default_validation());
+        assert!(source.probe().0.is_err());
+        assert!(!source.has_default_validation());
+        let disk = super::UsdSource::new("disk.usda", b"#usda 1.0\n".as_slice()).unwrap();
+        assert!(disk.probe().0.is_ok());
+        assert!(!disk.has_default_validation());
+        let missing = super::UsdSource::snapshot(
+            "missing.usda",
+            b"#usda 1.0\ndef Xform \"M\" (prepend references = @absent.usda@</M>) {}\n".as_slice(),
+        )
+        .unwrap();
+        let (_, requests) = missing.probe();
+        assert!(!requests.is_empty());
+        assert!(!missing.has_default_validation());
+    }
+
+    #[test]
+    fn typed_builder_publishes_independent_snapshot_without_files() {
+        use openusd_schemas::geom::{Sphere, SphereSchema};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("typed.usda");
+        let source = super::UsdSource::build(&path, |stage| {
+            Sphere::define(stage, "/Model")?
+                .create_radius_attr()?
+                .set(2.5_f64)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!source.filesystem);
+        assert!(!path.exists());
+        let first = source.open_stage().unwrap();
+        Sphere::define(&first, "/Model")
+            .unwrap()
+            .create_radius_attr()
+            .unwrap()
+            .set(4.0_f64)
+            .unwrap();
+        assert_eq!(
+            source
+                .open_stage()
+                .unwrap()
+                .prim("/Model")
+                .unwrap()
+                .attribute("radius")
+                .get::<f64>()
+                .unwrap(),
+            Some(2.5)
+        );
+        let assembly = super::UsdSource::build(directory.path().join("assembly.usda"), |_| Ok(()))
+            .unwrap()
+            .with_reference("/Copy", &source, openusd::sdf::path("/Model").unwrap())
+            .unwrap();
+        assert_eq!(
+            assembly
+                .open_stage()
+                .unwrap()
+                .prim("/Copy")
+                .unwrap()
+                .attribute("radius")
+                .get::<f64>()
+                .unwrap(),
+            Some(2.5)
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn typed_builder_rejects_failed_authoring_and_missing_composition() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            super::UsdSource::build(directory.path().join("wrong.usdc"), |_| panic!(
+                "must reject before callback"
+            ))
+            .is_err()
+        );
+        let path = directory.path().join("failed.usda");
+        assert!(super::UsdSource::build(&path, |_| anyhow::bail!("authoring failed")).is_err());
+        assert!(
+            super::UsdSource::build(&path, |stage| {
+                crate::authoring::define_prim(stage, "/Missing", "Xform")?;
+                crate::authoring::set_references(
+                    stage,
+                    "/Missing",
+                    &[openusd::sdf::Reference {
+                        asset_path: "missing.usda".into(),
+                        ..Default::default()
+                    }],
+                )?;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn nested_packages_preserve_relative_layers_and_asset_bytes() {
+        use super::*;
+        fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut writer = openusd::usdz::ArchiveWriter::new(Cursor::new(Vec::new()));
+            for (name, bytes) in entries {
+                writer.add_layer(name, bytes).unwrap();
+            }
+            writer.finish().unwrap().into_inner()
+        }
+        let inner = archive(&[
+            ("scenes/model.usda", b"#usda 1.0\n(defaultPrim = \"Model\")\ndef Xform \"Model\" (references = @part.usda@</Part>) {}\n"),
+            ("scenes/part.usda", b"#usda 1.0\ndef Xform \"Part\" {\n    asset paint = @pixel.png@\n    def Cube \"Box\" {}\n}\n"),
+            ("scenes/pixel.png", b"captured nested pixels"),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        for (name, reference) in [
+            ("implicit", "inner.usdz"),
+            ("explicit", "inner.usdz[scenes/model.usda]"),
+        ] {
+            let root = format!(
+                "#usda 1.0\ndef Xform \"Root\" (references = @{reference}@</Model>) {{}}\n"
+            );
+            let bytes = archive(&[("root.usda", root.as_bytes()), ("inner.usdz", &inner)]);
+            let virtual_path = directory.path().join(format!("virtual-{name}.usdz"));
+            let source = UsdSource::snapshot(&virtual_path, bytes.clone()).unwrap();
+            let stage = source.open_stage().unwrap();
+            UsdSource::validate_composition(&stage).unwrap();
+            assert!(stage.prim("/Root/Box").unwrap().is_valid().unwrap());
+            let asset = stage
+                .prim("/Root")
+                .unwrap()
+                .attribute("paint")
+                .get::<openusd::sdf::AssetPath>()
+                .unwrap()
+                .unwrap();
+            assert_eq!(asset.authored_path, "pixel.png");
+            assert_eq!(
+                source.read_asset(asset.resolved_path().unwrap()).unwrap(),
+                b"captured nested pixels"
+            );
+            assert!(!virtual_path.exists());
+            assert!(
+                source
+                    .read_asset(&format!("{}[inner.usdz[missing.png]]", source.identifier()))
+                    .is_err()
+            );
+            let disk = directory.path().join(format!("{name}.usdz"));
+            std::fs::write(&disk, &bytes).unwrap();
+            let stage = Stage::open(disk.to_str().unwrap()).unwrap();
+            UsdSource::validate_composition(&stage).unwrap();
+            assert!(stage.prim("/Root/Box").unwrap().is_valid().unwrap());
+            let asset = stage
+                .prim("/Root")
+                .unwrap()
+                .attribute("paint")
+                .get::<openusd::sdf::AssetPath>()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                DefaultResolver::new()
+                    .open_asset(&ResolvedPath::new(asset.resolved_path().unwrap()))
+                    .unwrap()
+                    .read_all()
+                    .unwrap(),
+                b"captured nested pixels"
+            );
+            assert_eq!(std::fs::read(&disk).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn clip_switch_interpolates_to_the_next_activation_sample() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = super::UsdSource::snapshot(
+            directory.path().join("root.usda"),
+            br#"#usda 1.0
+def Sphere "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@a.usda@, @b.usda@]
+            double2[] active = [(0, 0), (10, 1)]
+            string primPath = "/Model"
+        }
+    }
+) {
+    double radius
+}
+"#
+            .as_slice(),
+        )
+        .unwrap();
+        let a = super::UsdSource::snapshot(
+            directory.path().join("a.usda"),
+            br#"#usda 1.0
+def Sphere "Model" {
+    double radius.timeSamples = {0: 1, 20: 3}
+}
+"#
+            .as_slice(),
+        )
+        .unwrap();
+        let b = super::UsdSource::snapshot(
+            directory.path().join("b.usda"),
+            br#"#usda 1.0
+def Sphere "Model" {
+    double radius.timeSamples = {0: 5, 20: 7}
+}
+"#
+            .as_slice(),
+        )
+        .unwrap();
+        let stage = source
+            .with_dependency(&a)
+            .unwrap()
+            .with_dependency(&b)
+            .unwrap()
+            .open_stage()
+            .unwrap();
+        let radius = stage.attribute("/Model.radius").unwrap();
+        assert_eq!(radius.time_sample_times().unwrap(), [0.0, 10.0, 20.0]);
+        for (time, expected) in [
+            (0.0, 1.0),
+            (5.0, 3.5),
+            (9.0, 5.5),
+            (10.0, 6.0),
+            (15.0, 6.5),
+            (20.0, 7.0),
+        ] {
+            assert_eq!(
+                radius
+                    .get_at::<f64>(Some(openusd::usd::TimeCode::new(time)))
+                    .unwrap(),
+                Some(expected),
+                "time {time}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_discovers_numeric_value_clip_layers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = super::UsdSource::snapshot(
+            directory.path().join("root.usda"),
+            br#"#usda 1.0
+def Sphere "Model" (
+    clips = {
+        dictionary default = {
+            asset[] assetPaths = [@clipped_sphere_values.usda@]
+            double2[] active = [(0, 0)]
+            double2[] times = [(0, 0), (20, 10)]
+            string primPath = "/Model"
+        }
+    }
+) { double radius }
+"#
+            .as_slice(),
+        )
+        .unwrap();
+        let clip = directory
+            .path()
+            .join("clipped_sphere_values.usda")
+            .to_string_lossy()
+            .into_owned();
+        let (_, missing) = source.probe();
+        assert!(
+            missing.contains(&clip),
+            "numeric clip not discovered: {missing:?}"
+        );
+        source.insert_dependency(
+            clip,
+            br#"#usda 1.0
+def Sphere "Model" { double radius.timeSamples = {0: 1, 10: 3} }
+"#
+            .to_vec(),
+        );
+        let (result, missing) = source.probe();
+        result.unwrap();
+        assert!(missing.is_empty());
+        let stage = source.open_stage().unwrap();
+        assert_eq!(
+            stage
+                .attribute("/Model.radius")
+                .unwrap()
+                .get_at::<f64>(Some(openusd::usd::TimeCode::new(10.0)))
+                .unwrap(),
+            Some(2.0)
+        );
+    }
+
+    use super::*;
+
+    #[test]
+    fn composition_validation_rechecks_shared_prototypes_after_edits() {
+        let source = UsdSource::snapshot(
+            "validation-instances.usda",
+            br#"#usda 1.0
+def Xform "Template" {
+    def Sphere "Shape" { double radius.timeSamples = {0: 1, 10: 2} }
+}
+def Xform "First" (
+    instanceable = true
+    prepend references = </Template>
+) {}
+def Xform "Second" (
+    instanceable = true
+    prepend references = </Template>
+) {}
+"#
+            .as_slice(),
+        )
+        .unwrap();
+        let stage = source.open_stage().unwrap();
+        let first = stage
+            .prim("/First/Shape")
+            .unwrap()
+            .prim_in_prototype()
+            .unwrap()
+            .unwrap();
+        let second = stage
+            .prim("/Second/Shape")
+            .unwrap()
+            .prim_in_prototype()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.path(), second.path());
+        UsdSource::validate_composition(&stage).unwrap();
+        stage
+            .prim("/Template/Shape")
+            .unwrap()
+            .set_metadata(
+                "references",
+                openusd::vt::Value::ReferenceListOp(openusd::sdf::ListOp::prepended([
+                    openusd::sdf::Reference {
+                        prim_path: openusd::sdf::path("/Template").unwrap(),
+                        layer_offset: openusd::sdf::LayerOffset::new(0.0, -1.0),
+                        ..Default::default()
+                    },
+                ])),
+            )
+            .unwrap();
+        assert!(UsdSource::validate_composition(&stage).is_err());
+    }
+
+    #[test]
+    fn reference_assembly_preserves_sources_dependencies_and_reuse() {
+        use openusd_schemas::geom::{Sphere, SphereSchema};
+        let directory = tempfile::tempdir().unwrap();
+        let model_stage = Stage::builder()
+            .schema_registry(openusd_schemas::schema_registry())
+            .in_memory("model.usda")
+            .unwrap();
+        Sphere::define(&model_stage, "/Model")
+            .unwrap()
+            .create_radius_attr()
+            .unwrap()
+            .set(1.5_f64)
+            .unwrap();
+        let image =
+            UsdSource::snapshot(directory.path().join("texture.bin"), &b"texture bytes"[..])
+                .unwrap();
+        let model = UsdSource::snapshot(
+            directory.path().join("model.usda"),
+            model_stage
+                .root_layer()
+                .export_to_string()
+                .unwrap()
+                .into_bytes(),
+        )
+        .unwrap()
+        .with_dependency(&image)
+        .unwrap();
+        let root =
+            UsdSource::snapshot(directory.path().join("root.usda"), &b"#usda 1.0\n"[..]).unwrap();
+        let before = root.bytes.clone();
+        let first = root
+            .with_reference("/Assembly/First", &model, "/Model")
+            .unwrap();
+        let second = first
+            .with_reference("/Assembly/Second", &model, "/Model")
+            .unwrap();
+        let stage = second.open_stage().unwrap();
+        for path in ["/Assembly/First", "/Assembly/Second"] {
+            assert_eq!(
+                stage.prim(path).unwrap().type_name().unwrap().as_deref(),
+                Some("Sphere")
+            );
+            assert_eq!(
+                stage
+                    .prim(path)
+                    .unwrap()
+                    .attribute("radius")
+                    .get::<f64>()
+                    .unwrap(),
+                Some(1.5)
+            );
+        }
+        assert_eq!(second.dependencies().count(), 2);
+        assert_eq!(
+            second.read_asset(image.identifier()).unwrap(),
+            b"texture bytes"
+        );
+        assert_eq!(root.bytes, before);
+        assert!(
+            !first
+                .open_stage()
+                .unwrap()
+                .prim("/Assembly/Second")
+                .unwrap()
+                .is_valid()
+                .unwrap()
+        );
+        assert_eq!(
+            model
+                .open_stage()
+                .unwrap()
+                .root_layer()
+                .export_to_string()
+                .unwrap(),
+            model_stage.root_layer().export_to_string().unwrap()
+        );
+        assert!(!root.filesystem && !first.filesystem && !second.filesystem);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn typed_snapshot_edits_preserve_dependencies_and_inputs() {
+        use crate::editor::EditorEdit;
+        use openusd::vt::Value;
+        let directory = tempfile::tempdir().unwrap();
+        let model = UsdSource::snapshot(
+            directory.path().join("model.usda"),
+            &b"#usda 1.0\ndef Cube \"Model\" {}\n"[..],
+        )
+        .unwrap();
+        let source = UsdSource::snapshot(directory.path().join("root.usda"), &b"#usda 1.0\n"[..])
+            .unwrap()
+            .with_reference("/Object", &model, "/Model")
+            .unwrap();
+        let original = source.bytes.clone();
+        let edited = source
+            .with_edits([
+                EditorEdit::Attribute {
+                    prim: "/Object".into(),
+                    name: "size".into(),
+                    type_name: "double".into(),
+                    value: Value::Double(3.),
+                },
+                EditorEdit::Define {
+                    path: "/Other".into(),
+                    type_name: "Sphere".into(),
+                },
+                EditorEdit::RelationshipTargets {
+                    prim: "/Other".into(),
+                    name: "peer".into(),
+                    targets: vec![openusd::sdf::path("/Object").unwrap()],
+                },
+            ])
+            .unwrap();
+        let stage = edited.open_stage().unwrap();
+        assert_eq!(
+            stage
+                .prim("/Object")
+                .unwrap()
+                .attribute("size")
+                .get::<f64>()
+                .unwrap(),
+            Some(3.)
+        );
+        assert!(stage.prim("/Other").unwrap().is_valid().unwrap());
+        assert_eq!(edited.files, source.files);
+        assert!(!edited.filesystem);
+        assert_eq!(edited.identifier, source.identifier);
+        assert_ne!(edited.revision(), source.revision());
+        assert_eq!(source.bytes, original);
+        assert!(
+            !source
+                .open_stage()
+                .unwrap()
+                .prim("/Other")
+                .unwrap()
+                .is_valid()
+                .unwrap()
+        );
+        assert_eq!(
+            model
+                .open_stage()
+                .unwrap()
+                .prim("/Model")
+                .unwrap()
+                .attribute("size")
+                .get::<f64>()
+                .unwrap(),
+            Some(2.)
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(source.with_edits([]).unwrap().revision(), source.revision());
+        assert!(
+            source
+                .with_edits([
+                    EditorEdit::Define {
+                        path: "/Partial".into(),
+                        type_name: "Cube".into()
+                    },
+                    EditorEdit::Attribute {
+                        prim: "/Partial".into(),
+                        name: "size".into(),
+                        type_name: "double".into(),
+                        value: Value::String("invalid".into())
+                    },
+                ])
+                .is_err()
+        );
+        assert_eq!(source.bytes, original);
+        assert!(
+            !source
+                .open_stage()
+                .unwrap()
+                .prim("/Partial")
+                .unwrap()
+                .is_valid()
+                .unwrap()
+        );
+        assert!(
+            source
+                .with_edits([
+                    EditorEdit::Define {
+                        path: "/Broken".into(),
+                        type_name: String::new()
+                    },
+                    EditorEdit::References {
+                        prim: "/Broken".into(),
+                        references: vec![openusd::sdf::Reference {
+                            asset_path: "missing.usda".into(),
+                            prim_path: openusd::sdf::path("/Model").unwrap(),
+                            ..Default::default()
+                        }]
+                    },
+                ])
+                .is_err()
+        );
+        assert_eq!(source.bytes, original);
+        let binary_name = UsdSource::snapshot("root.usdc", &b"#usda 1.0\n"[..]).unwrap();
+        assert!(
+            binary_name
+                .with_edits([EditorEdit::Define {
+                    path: "/New".into(),
+                    type_name: "Cube".into()
+                }])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reference_batches_match_sequential_mounts_and_reject_late_conflicts() {
+        let root = UsdSource::snapshot("batch/root.usda", &b"#usda 1.0\n"[..]).unwrap();
+        let sphere = UsdSource::snapshot(
+            "batch/sphere.usda",
+            &b"#usda 1.0\ndef Sphere \"Model\" {}\n"[..],
+        )
+        .unwrap();
+        let cube = UsdSource::snapshot(
+            "batch/cube.usda",
+            &b"#usda 1.0\ndef Cube \"Model\" {}\n"[..],
+        )
+        .unwrap();
+        let batch = root
+            .with_references([
+                ("/First", &sphere, "/Model"),
+                ("/Second", &cube, "/Model"),
+                ("/Third", &sphere, "/Model"),
+            ])
+            .unwrap();
+        let sequential = root
+            .with_reference("/First", &sphere, "/Model")
+            .unwrap()
+            .with_reference("/Second", &cube, "/Model")
+            .unwrap()
+            .with_reference("/Third", &sphere, "/Model")
+            .unwrap();
+        assert_eq!(batch.bytes, sequential.bytes);
+        assert_eq!(
+            batch.dependencies().collect::<Vec<_>>(),
+            sequential.dependencies().collect::<Vec<_>>()
+        );
+        let stage = batch.open_stage().unwrap();
+        for (path, name) in [
+            ("/First", "Sphere"),
+            ("/Second", "Cube"),
+            ("/Third", "Sphere"),
+        ] {
+            assert_eq!(
+                stage.prim(path).unwrap().type_name().unwrap().as_deref(),
+                Some(name)
+            );
+        }
+        let empty = root
+            .with_references(std::iter::empty::<(&str, &UsdSource, &str)>())
+            .unwrap();
+        assert_eq!(empty.revision(), root.revision());
+        assert!(Arc::ptr_eq(&empty.bytes, &root.bytes));
+        assert!(
+            root.with_references([("/First", &sphere, "/Model"), ("/First", &cube, "/Model"),])
+                .is_err()
+        );
+        let conflict = UsdSource::snapshot(sphere.identifier(), cube.bytes.clone()).unwrap();
+        assert!(
+            root.with_references([
+                ("/First", &sphere, "/Model"),
+                ("/Second", &conflict, "/Model"),
+            ])
+            .is_err()
+        );
+        assert_eq!(root.bytes.as_ref(), b"#usda 1.0\n");
+        assert_eq!(root.dependencies().count(), 0);
+    }
+
+    #[test]
+    fn instanceable_reference_batches_share_native_prototypes() {
+        use openusd::sdf::{LayerOffset, Path};
+        let root = UsdSource::snapshot("instanced/root.usda", &b"#usda 1.0\n"[..]).unwrap();
+        let model = UsdSource::snapshot("instanced/model.usda", &b"#usda 1.0\n(defaultPrim = \"Model\")\ndef Xform \"Model\" { def Cube \"Geometry\" {} }\n"[..]).unwrap();
+        let assembly = root
+            .with_instanceable_references([
+                ("/First", &model, Path::default(), LayerOffset::IDENTITY),
+                ("/Second", &model, Path::default(), LayerOffset::IDENTITY),
+            ])
+            .unwrap();
+        let stage = assembly.open_stage().unwrap();
+        let first = stage.prim("/First").unwrap();
+        let second = stage.prim("/Second").unwrap();
+        assert!(first.is_instance().unwrap() && second.is_instance().unwrap());
+        assert!(first.prototype().unwrap().is_some());
+        assert_eq!(first.prototype().unwrap(), second.prototype().unwrap());
+        for path in ["/First/Geometry", "/Second/Geometry"] {
+            let prim = stage.prim(path).unwrap();
+            assert!(prim.is_instance_proxy().unwrap());
+            assert_eq!(prim.type_name().unwrap().as_deref(), Some("Cube"));
+        }
+        assert_eq!(assembly.dependencies().count(), 1);
+        assert_eq!(&*root.bytes, b"#usda 1.0\n");
+        assert!(
+            !model
+                .open_stage()
+                .unwrap()
+                .prim("/Model")
+                .unwrap()
+                .is_instance()
+                .unwrap()
+        );
+        let ordinary = root
+            .with_reference("/First", &model, Path::default())
+            .unwrap()
+            .open_stage()
+            .unwrap();
+        assert!(!ordinary.prim("/First").unwrap().is_instance().unwrap());
+        assert!(
+            root.with_instanceable_references([
+                ("/First", &model, Path::default(), LayerOffset::IDENTITY),
+                (
+                    "/First/Geometry",
+                    &model,
+                    Path::default(),
+                    LayerOffset::IDENTITY
+                ),
+            ])
+            .is_err()
+        );
+        assert!(root.dependencies().next().is_none());
+    }
+
+    #[test]
+    fn offset_reference_batches_preserve_arcs_and_retime_samples() {
+        use openusd::{
+            sdf::{LayerOffset, Path},
+            vt::Value,
+        };
+        let root = UsdSource::snapshot("retimed/root.usda", &b"#usda 1.0\n"[..]).unwrap();
+        let model = UsdSource::snapshot("retimed/model.usda", &b"#usda 1.0\n(defaultPrim = \"Model\")\ndef Sphere \"Model\" { double radius.timeSamples = {0: 1, 10: 3} }\n"[..]).unwrap();
+        let offset = LayerOffset::new(10.0, 2.0);
+        let assembly = root
+            .with_offset_references([
+                (
+                    "/Original",
+                    &model,
+                    Path::new("/Model").unwrap(),
+                    LayerOffset::IDENTITY,
+                ),
+                ("/Retimed", &model, Path::default(), offset),
+            ])
+            .unwrap();
+        let stage = assembly.open_stage().unwrap();
+        for (path, time, expected) in [
+            ("/Original", 10.0, 3.0),
+            ("/Retimed", 10.0, 1.0),
+            ("/Retimed", 20.0, 2.0),
+            ("/Retimed", 30.0, 3.0),
+        ] {
+            assert_eq!(
+                stage
+                    .prim(path)
+                    .unwrap()
+                    .attribute("radius")
+                    .get_at::<f64>(Some(openusd::usd::TimeCode::new(time)))
+                    .unwrap(),
+                Some(expected)
+            );
+        }
+        let Value::ReferenceListOp(arcs) = stage
+            .prim("/Retimed")
+            .unwrap()
+            .metadata("references")
+            .unwrap()
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(arcs.explicit_items()[0].prim_path.is_empty());
+        assert_eq!(arcs.explicit_items()[0].layer_offset, offset);
+        assert_eq!(assembly.dependencies().count(), 1);
+        for invalid in [
+            LayerOffset::new(f64::NAN, 1.0),
+            LayerOffset::new(0.0, f64::INFINITY),
+            LayerOffset::new(0.0, 0.0),
+            LayerOffset::new(0.0, -1.0),
+        ] {
+            assert!(
+                root.with_offset_references([
+                    ("/Valid", &model, "/Model", offset),
+                    ("/Invalid", &model, "/Model", invalid),
+                ])
+                .is_err()
+            );
+        }
+        assert_eq!(&*root.bytes, b"#usda 1.0\n");
+        assert!(root.dependencies().next().is_none());
+    }
+
+    #[test]
+    fn reference_assembly_uses_and_preserves_default_prim_arcs() {
+        let root = UsdSource::snapshot("defaults/root.usda", &b"#usda 1.0\n"[..]).unwrap();
+        let model = UsdSource::snapshot(
+            "defaults/model.usda",
+            &b"#usda 1.0\n(defaultPrim = \"Model\")\ndef Sphere \"Model\" { double radius = 2 }\n"
+                [..],
+        )
+        .unwrap();
+        let assembly = root
+            .with_reference("/Instance", &model, openusd::sdf::Path::default())
+            .unwrap();
+        let stage = assembly.open_stage().unwrap();
+        assert_eq!(
+            stage
+                .prim("/Instance")
+                .unwrap()
+                .attribute("radius")
+                .get::<f64>()
+                .unwrap(),
+            Some(2.0)
+        );
+        let openusd::vt::Value::ReferenceListOp(references) = stage
+            .prim("/Instance")
+            .unwrap()
+            .metadata("references")
+            .unwrap()
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(references.explicit_items().len(), 1);
+        assert!(references.explicit_items()[0].prim_path.is_empty());
+        let changed = UsdSource::snapshot(
+            "defaults/model.usda",
+            &b"#usda 1.0\n(defaultPrim = \"Other\")\ndef Cube \"Other\" {}\n"[..],
+        )
+        .unwrap();
+        let replacement = root
+            .with_reference("/Instance", &changed, openusd::sdf::Path::default())
+            .unwrap();
+        assert_eq!(
+            replacement
+                .open_stage()
+                .unwrap()
+                .prim("/Instance")
+                .unwrap()
+                .type_name()
+                .unwrap()
+                .as_deref(),
+            Some("Cube")
+        );
+        for contents in [
+            "#usda 1.0\ndef Sphere \"Model\" {}\n",
+            "#usda 1.0\n(defaultPrim = \"Missing\")\ndef Sphere \"Model\" {}\n",
+        ] {
+            let invalid =
+                UsdSource::snapshot("defaults/invalid.usda", contents.as_bytes()).unwrap();
+            assert!(
+                root.with_reference("/Instance", &invalid, openusd::sdf::Path::default())
+                    .is_err()
+            );
+        }
+        assert!(
+            root.with_reference(openusd::sdf::Path::default(), &model, "/Model")
+                .is_err()
+        );
+        assert!(root.dependencies().next().is_none());
+    }
+
+    #[test]
+    fn reference_assembly_exports_respect_composition_modes() {
+        let input = tempfile::tempdir().unwrap();
+        let root =
+            UsdSource::snapshot(input.path().join("root.usda"), &b"#usda 1.0\n"[..]).unwrap();
+        let model = UsdSource::snapshot(
+            input.path().join("model.usda"),
+            &b"#usda 1.0\ndef Sphere \"Model\" { double radius = 1.5 }\n"[..],
+        )
+        .unwrap();
+        let assembly = root
+            .with_reference("/First", &model, "/Model")
+            .unwrap()
+            .with_reference("/Second", &model, "/Model")
+            .unwrap();
+        let editor = crate::editor::EditorSession::new(assembly.open_stage().unwrap());
+        let output = tempfile::tempdir().unwrap();
+        for (extension, mode, retains_references) in [
+            ("usda", crate::editor::SaveMode::Flattened, false),
+            ("usdc", crate::editor::SaveMode::Flattened, false),
+            ("usdz", crate::editor::SaveMode::RootLayer, true),
+        ] {
+            let original = output.path().join(format!("original-{extension}"));
+            std::fs::create_dir(&original).unwrap();
+            let filename = format!("assembly.{extension}");
+            editor
+                .save(original.join(&filename).to_str().unwrap(), mode)
+                .unwrap();
+            let moved = output.path().join(format!("moved-{extension}"));
+            std::fs::rename(&original, &moved).unwrap();
+            let file = moved.join(&filename);
+            let reopened = UsdSource::new(&file, std::fs::read(&file).unwrap())
+                .unwrap()
+                .open_stage()
+                .unwrap();
+            UsdSource::validate_composition(&reopened).unwrap();
+            for path in ["/First", "/Second"] {
+                let prim = reopened.prim(path).unwrap();
+                assert_eq!(prim.type_name().unwrap().as_deref(), Some("Sphere"));
+                assert_eq!(prim.attribute("radius").get::<f64>().unwrap(), Some(1.5));
+                assert_eq!(
+                    matches!(
+                        prim.metadata("references").unwrap(),
+                        Some(openusd::vt::Value::ReferenceListOp(_))
+                    ),
+                    retains_references
+                );
+            }
+        }
+        for extension in ["usda", "usdc"] {
+            let path = output.path().join(format!("unbundled.{extension}"));
+            editor
+                .save(path.to_str().unwrap(), crate::editor::SaveMode::RootLayer)
+                .unwrap();
+            let reopened = UsdSource::new(&path, std::fs::read(&path).unwrap())
+                .unwrap()
+                .open_stage()
+                .unwrap();
+            assert!(
+                UsdSource::validate_composition(&reopened)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("model.usda")
+            );
+            assert!(matches!(
+                reopened
+                    .prim("/First")
+                    .unwrap()
+                    .metadata("references")
+                    .unwrap(),
+                Some(openusd::vt::Value::ReferenceListOp(_))
+            ));
+        }
+        assert_eq!(std::fs::read_dir(input.path()).unwrap().count(), 0);
+        assert_eq!(root.dependencies().count(), 0);
+    }
+
+    #[test]
+    fn reference_assembly_rejects_invalid_inputs_without_changing_sources() {
+        let root = UsdSource::snapshot(
+            "assembly/root.usda",
+            &b"#usda 1.0\ndef Scope \"Existing\" {}\n"[..],
+        )
+        .unwrap();
+        let model = UsdSource::snapshot(
+            "assembly/model.usda",
+            &b"#usda 1.0\ndef Sphere \"Model\" {}\n"[..],
+        )
+        .unwrap();
+        let before = root.bytes.clone();
+        for path in ["/", "relative", "/Prim.attr", "/Prim{choice=a}"] {
+            assert!(root.with_reference(path, &model, "/Model").is_err());
+            assert!(root.with_reference("/New", &model, path).is_err());
+        }
+        assert!(root.with_reference("/Existing", &model, "/Model").is_err());
+        assert!(root.with_reference("/New", &model, "/Missing").is_err());
+        let incomplete = UsdSource::snapshot("assembly/incomplete.usda",
+            &b"#usda 1.0\ndef Sphere \"Model\" (prepend references = @missing.usda@</Missing>) {}\n"[..]).unwrap();
+        assert!(root.with_reference("/New", &incomplete, "/Model").is_err());
+        let conflict = UsdSource::snapshot(
+            root.identifier(),
+            &b"#usda 1.0\ndef Scope \"Other\" {}\n"[..],
+        )
+        .unwrap();
+        assert!(root.with_reference("/New", &conflict, "/Other").is_err());
+        let package = UsdSource::snapshot("assembly/root.usdz", &b"not a package"[..]).unwrap();
+        assert!(package.with_reference("/New", &model, "/Model").is_err());
+        assert_eq!(root.bytes, before);
+        assert_eq!(root.dependencies().count(), 0);
+    }
+
+    #[test]
+    fn asset_reads_reject_unresolved_working_directory_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let source =
+            UsdSource::new(directory.path().join("scene.usda"), &b"root bytes"[..]).unwrap();
+        let cwd_file = std::env::current_dir().unwrap().join("Cargo.toml");
+        assert!(cwd_file.is_file());
+        let error = source.read_asset("Cargo.toml").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("unresolved asset identifier"));
+        assert_eq!(
+            source.read_asset(cwd_file.to_str().unwrap()).unwrap(),
+            std::fs::read(cwd_file).unwrap()
+        );
+        assert_eq!(
+            source.read_asset(source.identifier()).unwrap(),
+            b"root bytes"
+        );
+    }
+
+    #[test]
+    fn captured_asset_handles_share_bytes_with_independent_cursors() {
+        let root: Arc<[u8]> = Arc::from(b"root contents".as_slice());
+        let dependency: Arc<[u8]> = Arc::from(b"dependency contents".as_slice());
+        let source = UsdSource::snapshot("shared/root.usda", root.clone())
+            .unwrap()
+            .with_dependency(&UsdSource::snapshot("shared/data.bin", dependency.clone()).unwrap())
+            .unwrap();
+        let resolver = SourceResolver {
+            source,
+            fallback: DefaultResolver::new(),
+            requests: Arc::default(),
+            disk_baselines: None,
+            fetch: None,
+        };
+        for (identifier, bytes) in [
+            (resolver.source.identifier(), &root),
+            (resolver.source.dependencies().next().unwrap(), &dependency),
+        ] {
+            let before = Arc::strong_count(bytes);
+            let mut first = resolver.open_asset(&ResolvedPath::new(identifier)).unwrap();
+            let mut second = resolver.open_asset(&ResolvedPath::new(identifier)).unwrap();
+            assert_eq!(Arc::strong_count(bytes), before + 2);
+            assert_eq!(first.size().unwrap(), bytes.len() as u64);
+            let mut prefix = [0; 4];
+            first.read_exact(&mut prefix).unwrap();
+            assert_eq!(&prefix, &bytes[..4]);
+            assert_eq!(second.read_all().unwrap(), bytes.as_ref());
+            assert_eq!(first.read_all().unwrap(), &bytes[4..]);
+            first.seek(SeekFrom::End(-3)).unwrap();
+            assert_eq!(first.read_all().unwrap(), &bytes[bytes.len() - 3..]);
+            first.rewind().unwrap();
+            assert_eq!(first.read_all().unwrap(), bytes.as_ref());
+            assert!(first.seek(SeekFrom::Current(-1000)).is_err());
+            drop((first, second));
+            assert_eq!(Arc::strong_count(bytes), before);
+        }
+        let identifier = resolver.source.identifier().to_string();
+        let mut asset = resolver.open_asset(&ResolvedPath::new(identifier)).unwrap();
+        drop(resolver);
+        assert_eq!(
+            std::thread::spawn(move || asset.read_all().unwrap())
+                .join()
+                .unwrap(),
+            root.as_ref()
+        );
+    }
+
+    #[test]
+    fn composition_validation_follows_active_variant_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = UsdSource::snapshot(
+            directory.path().join("variants.usda"),
+            &br#"#usda 1.0
+def Scope "Model" (
+    prepend variantSets = ["choice"]
+    variants = { string choice = "good" }
+) {
+    variantSet "choice" = {
+        "good" {
+            def Scope "Content" {}
+        }
+        "bad" {
+            def Scope "Content" (prepend references = @missing.usda@</Model>) {}
+        }
+    }
+}
+"#[..],
+        )
+        .unwrap();
+        let (result, missing) = source.probe();
+        result.unwrap();
+        assert!(missing.is_empty());
+        let stage = source.open_stage().unwrap();
+        crate::authoring::set_variant(&stage, "/Model", "choice", "bad").unwrap();
+        let error = UsdSource::validate_composition(&stage).unwrap_err();
+        assert!(error.to_string().contains("missing.usda"));
+        crate::authoring::set_variant(&stage, "/Model", "choice", "good").unwrap();
+        UsdSource::validate_composition(&stage).unwrap();
+    }
+
+    #[test]
+    fn snapshot_anchors_parent_relative_paths_before_normalizing() {
+        let cwd = std::env::current_dir().unwrap();
+        let expected = normalize(&cwd.join("../virtual-source.usda"));
+        let source = UsdSource::snapshot("../virtual-source.usda", &b"root"[..]).unwrap();
+        assert_eq!(source.identifier(), expected.to_str().unwrap());
+    }
+
+    #[test]
+    fn merged_sources_preserve_transitive_layer_and_asset_anchors() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = |name: &str, bytes: &[u8]| {
+            UsdSource::snapshot(&directory.path().join(name), bytes.to_vec()).unwrap()
+        };
+        let weak = source(
+            "parts/weak.usda",
+            b"#usda 1.0\ndef Scope \"Model\" {\n double score = 17\n}\n",
+        );
+        let paint = source("paint.bin", b"captured paint");
+        let model = source("parts/model.usda", b"#usda 1.0\n( subLayers = [@weak.usda@] )\ndef Scope \"Model\" {\n asset paint = @../paint.bin@\n}\n")
+            .with_dependency(&weak).unwrap().with_dependency(&paint).unwrap();
+        let root = source("root.usda", b"#usda 1.0\ndef Scope \"First\" (prepend references = @parts/model.usda@</Model>) {}\ndef Scope \"Second\" (prepend references = @parts/model.usda@</Model>) {}\n");
+        let assembled = root.with_dependency(&model).unwrap();
+        assert_eq!(root.dependencies().count(), 0);
+        assert_eq!(assembled.dependencies().count(), 3);
+        assert_ne!(assembled.revision(), root.revision());
+        assert_eq!(
+            assembled.with_dependency(&model).unwrap().revision(),
+            assembled.revision()
+        );
+        let stage = assembled.open_stage().unwrap();
+        for path in ["/First", "/Second"] {
+            let prim = stage.prim(path).unwrap();
+            assert_eq!(prim.attribute("score").get::<f64>().unwrap(), Some(17.0));
+            let value = prim
+                .attribute("paint")
+                .get::<openusd::vt::Value>()
+                .unwrap()
+                .unwrap();
+            let openusd::vt::Value::AssetPath(asset) = value else {
+                panic!("expected asset")
+            };
+            assert_eq!(
+                assembled
+                    .read_asset(asset.resolved_path().unwrap())
+                    .unwrap(),
+                b"captured paint"
+            );
+        }
+        let output = tempfile::tempdir().unwrap();
+        let package = output.path().join("assembled.usdz");
+        crate::authoring::save_stage_as(&stage, package.to_str().unwrap()).unwrap();
+        let bytes = std::fs::read(&package).unwrap();
+        std::fs::remove_file(&package).unwrap();
+        let reopened = UsdSource::snapshot(&package, bytes)
+            .unwrap()
+            .open_stage()
+            .unwrap();
+        assert_eq!(
+            reopened
+                .prim("/First")
+                .unwrap()
+                .attribute("score")
+                .get::<f64>()
+                .unwrap(),
+            Some(17.0)
+        );
+        assert_eq!(
+            reopened
+                .prim("/Second")
+                .unwrap()
+                .attribute("score")
+                .get::<f64>()
+                .unwrap(),
+            Some(17.0)
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn merging_conflicting_identifiers_never_changes_either_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = |name: &str, bytes: &[u8]| {
+            UsdSource::snapshot(&directory.path().join(name), bytes.to_vec()).unwrap()
+        };
+        let root = source("root.usda", b"root");
+        let original = source("asset.bin", b"original");
+        let root = root.with_dependency(&original).unwrap();
+        let conflict = source("asset.bin", b"replacement");
+        let incoming = source("extra.usda", b"extra")
+            .with_dependency(&conflict)
+            .unwrap();
+        assert_eq!(
+            root.with_dependency(&incoming).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(root.read_asset(original.identifier()).unwrap(), b"original");
+        assert_eq!(root.dependencies().count(), 1);
+        assert_eq!(incoming.dependencies().count(), 1);
+        assert!(
+            root.with_dependency(&source("root.usda", b"changed root"))
+                .is_err()
+        );
+        assert_eq!(
+            root.with_dependency(&root).unwrap().revision(),
+            root.revision()
+        );
+        let alias = source("parts/../asset.bin", b"replacement");
+        assert!(root.with_dependency(&alias).is_err());
+    }
+
+    #[test]
+    fn merged_sources_retain_the_receivers_filesystem_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let root_path = directory.path().join("root.usda");
+        let asset_path = directory.path().join("disk.bin");
+        std::fs::write(&asset_path, b"on disk").unwrap();
+        let closed = UsdSource::snapshot(&root_path, b"root".to_vec()).unwrap();
+        let open = UsdSource::new(&root_path, &b"root"[..]).unwrap();
+        let dependency =
+            UsdSource::new(directory.path().join("dependency.bin"), &b"captured"[..]).unwrap();
+        assert!(
+            closed
+                .with_dependency(&dependency)
+                .unwrap()
+                .read_asset(asset_path.to_str().unwrap())
+                .is_err()
+        );
+        assert_eq!(
+            open.with_dependency(&dependency)
+                .unwrap()
+                .read_asset(asset_path.to_str().unwrap())
+                .unwrap(),
+            b"on disk"
+        );
+    }
+
+    #[test]
+    fn bytes_are_the_root_layer_and_stages_are_independent() {
+        let source = UsdSource::new(
+            "virtual-root.usda",
+            &b"#usda 1.0\ndef Xform \"Model\" {}\n"[..],
+        )
+        .unwrap();
+        let first = source.open_stage().unwrap();
+        let second = source.open_stage().unwrap();
+        first.define_prim("/OnlyFirst").unwrap();
+        assert!(first.prim("/OnlyFirst").unwrap().is_valid().unwrap());
+        assert!(!second.prim("/OnlyFirst").unwrap().is_valid().unwrap());
+        let text = second.root_layer().export_to_string().unwrap();
+        assert!(text.contains("Model"));
+        assert!(!text.contains("subLayers"));
+        assert_eq!(second.root_layer().identifier(), source.identifier());
+    }
+
+    #[test]
+    fn malformed_bytes_fail_without_materialization() {
+        let source = UsdSource::new("invalid-root.usda", &b"not USD"[..]).unwrap();
+        assert!(source.open_stage().is_err());
+    }
+
+    #[test]
+    fn source_anchor_resolves_siblings_without_writing_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("virtual-root.usda");
+        std::fs::write(
+            directory.path().join("part.usda"),
+            b"#usda 1.0\ndef Xform \"Part\" { def Cube \"Box\" {} }\n",
+        )
+        .unwrap();
+        let source = UsdSource::new(
+            &root,
+            &b"#usda 1.0\ndef Xform \"Model\" (references = @part.usda@</Part>) {}\n"[..],
+        )
+        .unwrap();
+        let stage = source.open_stage().unwrap();
+        assert!(stage.prim("/Model/Box").unwrap().is_valid().unwrap());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn packaged_relative_references_resolve_from_memory() {
+        let mut archive = openusd::usdz::ArchiveWriter::new(Cursor::new(Vec::new()));
+        archive
+            .add_layer(
+                "scenes/root.usda",
+                b"#usda 1.0\ndef Xform \"Model\" (references = @part.usda@</Part>) {}\n",
+            )
+            .unwrap();
+        archive
+            .add_layer(
+                "scenes/part.usda",
+                b"#usda 1.0\ndef Xform \"Part\" { def Cube \"Box\" {} }\n",
+            )
+            .unwrap();
+        let bytes = archive.finish().unwrap().into_inner();
+        let source = UsdSource::new("virtual-package.usdz", bytes).unwrap();
+        let stage = source.open_stage().unwrap();
+        assert!(stage.prim("/Model/Box").unwrap().is_valid().unwrap());
+    }
+
+    #[test]
+    fn usdc_empty_string_arrays_read_as_empty() {
+        let file = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/external/chameleon.usdz"
+        );
+        let stage = UsdSource::from_file(file).unwrap().open_stage().unwrap();
+        let looks = "/Root/chameleon_mtl/Looks";
+        let name = "ui:nodegraph:realitykit:node:attributesShowingChildren";
+        let read = |prim: &str| {
+            let path = openusd::sdf::path(&format!("{looks}/{prim}")).unwrap();
+            crate::read::util::read_authored(&stage, &path, name).unwrap()
+        };
+        assert_eq!(
+            read("chameleon_camo_mat/Clamp"),
+            Some(openusd::vt::Value::StringVec(vec![]))
+        );
+        assert_eq!(
+            read("chameleon_blue_mat/PreviewSurface"),
+            Some(openusd::vt::Value::StringVec(vec![
+                "Advanced".into(),
+                "inputs:diffuseColor".into()
+            ]))
+        );
+    }
+}
