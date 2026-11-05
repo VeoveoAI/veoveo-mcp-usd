@@ -469,17 +469,19 @@ impl UsdSource {
         Self::relative_to_memory(self.probe_stage().1)
     }
 
-    /// [`Self::missing_dependencies`] with `overrides` applied, for a variant can
-    /// name files the default selections do not.
+    /// [`Self::missing_dependencies`] with `overrides` applied too, for a variant can
+    /// name files the default selections do not. The default selections' files
+    /// stay among them, since a loader composes those first.
     pub fn missing_dependencies_under(
         &self,
         overrides: &crate::instance::UsdInstanceOverrides,
     ) -> Vec<String> {
         let requests = Arc::new(Mutex::new(BTreeSet::new()));
-        if let Ok(stage) = self.open_tracked(requests.clone(), None, false)
-            && overrides.apply(&stage).is_ok()
-        {
+        if let Ok(stage) = self.open_tracked(requests.clone(), None, false) {
             let _ = Self::validate_composition(&stage);
+            if overrides.apply(&stage).is_ok() {
+                let _ = Self::validate_composition(&stage);
+            }
         }
         let missing = std::mem::take(&mut *requests.lock().expect("dependency requests"));
         Self::relative_to_memory(missing)

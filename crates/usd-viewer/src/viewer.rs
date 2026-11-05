@@ -26,7 +26,7 @@ use usd_bevy::{
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::{
-    panels::{self, CameraChoice, Facts, Selection},
+    panels::{self, CameraChoice, Facts, OverPanels, Selection},
     scenes,
 };
 
@@ -107,6 +107,7 @@ pub fn run() {
     .init_resource::<Facts>()
     .init_resource::<Selection>()
     .init_resource::<CameraChoice>()
+    .init_resource::<OverPanels>()
     .insert_resource(scenes::start())
     .insert_resource(DisplayPurposes {
         render: true,
@@ -297,9 +298,10 @@ fn orbit(
     motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     wants: Res<EguiWantsInput>,
+    over: Res<OverPanels>,
     mut choice: ResMut<CameraChoice>,
 ) {
-    if wants.wants_any_pointer_input() {
+    if over.0 || wants.wants_any_pointer_input() {
         return;
     }
     let notches = match scroll.unit {

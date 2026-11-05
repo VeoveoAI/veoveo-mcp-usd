@@ -17,6 +17,9 @@ use crate::{
 
 /// The most rows a list shows; a tree shows this many children of a prim.
 const MAX_ROWS: usize = 400;
+/// A list longer than this starts closed: a closed list costs its frame nothing, and the kitchen's
+/// 392 variant sets and 425 payloads open took it from 118 frames a second to 71.
+const OPEN_ROWS: usize = 16;
 /// How many stage time codes one step of the time buttons moves.
 const STEP: f64 = 1.0;
 
@@ -43,6 +46,10 @@ pub struct Facts {
     payloads: Vec<String>,
     payloads_read: bool,
 }
+
+/// Whether the pointer is over a panel, so that dragging and scrolling leave the stage alone.
+#[derive(Resource, Default)]
+pub struct OverPanels(pub bool);
 
 /// The prim the tree has selected.
 #[derive(Resource, Default)]
@@ -189,6 +196,7 @@ pub fn show(
     mut selection: ResMut<Selection>,
     mut choice: ResMut<CameraChoice>,
     mut seek: ResMut<Seek>,
+    mut over: ResMut<OverPanels>,
     scene_list: Res<Scenes>,
     instances: NonSend<UsdInstances>,
     time: Res<Time>,
@@ -213,7 +221,9 @@ pub fn show(
     let stage = root
         .as_ref()
         .and_then(|(entity, ..)| instances.stage(*entity));
-    egui::Panel::left("stage")
+    let pointer = context.pointer_latest_pos();
+    over.0 = false;
+    let left = egui::Panel::left("stage")
         .default_size(280.0)
         .show(&mut viewport, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -230,17 +240,18 @@ pub fn show(
                 }
             });
         });
+    over.0 |= pointer.is_some_and(|pointer| left.response.rect.contains(pointer));
     let Some((entity, state, mut current, mut playback, mut overrides)) = root else {
         return Ok(());
     };
-    egui::Panel::right("composition")
+    let right = egui::Panel::right("composition")
         .default_size(280.0)
         .show(&mut viewport, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 section(
                     ui,
                     format!("Variants ({})", facts.variants.len()),
-                    true,
+                    facts.variants.len() <= OPEN_ROWS,
                     |ui| {
                         if show_variants(ui, &facts, &mut overrides) {
                             facts.stale = true;
@@ -250,7 +261,7 @@ pub fn show(
                 section(
                     ui,
                     format!("Payloads ({})", facts.payloads.len()),
-                    true,
+                    facts.payloads.len() <= OPEN_ROWS,
                     |ui| {
                         if show_payloads(ui, &facts, stage, &instances, entity) {
                             facts.stale = true;
@@ -262,7 +273,8 @@ pub fn show(
                 });
             });
         });
-    egui::Panel::bottom("time").show(&mut viewport, |ui| {
+    over.0 |= pointer.is_some_and(|pointer| right.response.rect.contains(pointer));
+    let bottom = egui::Panel::bottom("time").show(&mut viewport, |ui| {
         ui.horizontal(|ui| {
             let moving = facts.end > facts.start;
             let label = if playback.playing { "Pause" } else { "Play" };
@@ -301,6 +313,7 @@ pub fn show(
             ui.label(status);
         });
     });
+    over.0 |= pointer.is_some_and(|pointer| bottom.response.rect.contains(pointer));
     Ok(())
 }
 
