@@ -20,4 +20,9 @@ Left out: `assets/external`, `media`, `src` (`usdview`) and its dependency `mara
 
 ## What we changed
 
-Nothing yet: this commit is the copy.
+- **Bevy 0.20.1.** The `crates/` part of upstream's draft PR #4 (`dave-gray101/bevy_openusd`, `feat-bevy-0.20` at
+  `5cbdee3f4c49`, 39 files, including shaders from WGSL to WESL), which targets Bevy 0.20.0 on `main`. It applied to `develop`
+  with one conflict: `develop` had removed the test `package_entry_budget_preserves_existing_destination`, which the PR
+  edits, so it stays removed. Its `usdview` and `mara` changes are left out. Then Bevy 0.20.1.
+- **`zip` 9.3.0,** from 8, because 8.6.0 has open advisories (RUSTSEC-2026-0367, 0368, 0369 and 0429). `name()` now returns a
+  `Result`, in `reload.rs` and in `persistence.rs`'s tests.
