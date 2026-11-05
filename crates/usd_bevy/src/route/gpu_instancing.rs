@@ -95,8 +95,8 @@ impl Plugin for UsdGpuInstancingPlugin {
         bevy::asset::embedded_asset!(app, "gpu_instancing.wesl");
         bevy::asset::embedded_asset!(app, "gpu_instancing_cull.wgsl");
         bevy::asset::embedded_asset!(app, "gpu_instancing_shadow.wesl");
-        bevy::asset::embedded_asset!(app, "gpu_instancing_types.wesl");
-        bevy::asset::embedded_asset!(app, "sheen_functions.wesl");
+        bevy::shader::load_shader_library!(app, "gpu_instancing_types.wesl");
+        bevy::shader::load_shader_library!(app, "sheen_functions.wesl");
         if !app.world().contains_resource::<UsdGpuInstancing>() {
             app.init_resource::<UsdGpuInstancing>();
         }

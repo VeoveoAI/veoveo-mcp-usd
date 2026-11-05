@@ -91,10 +91,11 @@ impl MaterialExtension for StrandCoverage {
 pub type StrandMaterial = bevy::pbr::ExtendedMaterial<StandardMaterial, StrandCoverage>;
 
 pub(crate) fn configure(app: &mut App) {
+    // The material's plugin loads these as it is added, so their bytes come first.
+    bevy::asset::embedded_asset!(app, "strand_material.wesl");
+    bevy::asset::embedded_asset!(app, "strand_prepass.wesl");
     if super::wrapped::configure::<StrandCoverage>(app) {
-        bevy::asset::embedded_asset!(app, "strand_material.wesl");
-        bevy::asset::embedded_asset!(app, "strand_prepass.wesl");
-        bevy::asset::embedded_asset!(app, "strand_functions.wesl");
+        bevy::shader::load_shader_library!(app, "strand_functions.wesl");
     }
 }
 

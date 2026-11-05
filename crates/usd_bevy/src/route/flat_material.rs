@@ -22,12 +22,12 @@ impl MaterialExtension for FlatNormals {
 pub type FlatMaterial = bevy::pbr::ExtendedMaterial<StandardMaterial, FlatNormals>;
 
 pub(crate) fn configure(app: &mut App) {
-    if !super::wrapped::configure::<FlatNormals>(app) {
-        return;
-    }
+    // The material's plugin loads these as it is added, so their bytes come first.
     bevy::asset::embedded_asset!(app, "flat_material.wesl");
     bevy::asset::embedded_asset!(app, "flat_prepass.wesl");
-    bevy::asset::embedded_asset!(app, "flat_functions.wesl");
+    if super::wrapped::configure::<FlatNormals>(app) {
+        bevy::shader::load_shader_library!(app, "flat_functions.wesl");
+    }
 }
 
 pub(crate) fn clear(world: &mut World, entity: Entity) {

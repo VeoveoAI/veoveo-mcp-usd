@@ -25,9 +25,10 @@ impl MaterialExtension for SheenLobe {
 pub type SheenMaterial = bevy::pbr::ExtendedMaterial<StandardMaterial, SheenLobe>;
 
 pub(crate) fn configure(app: &mut App) {
+    // The material's plugin loads this as it is added, so its bytes come first.
+    bevy::asset::embedded_asset!(app, "sheen_material.wesl");
     if super::wrapped::configure::<SheenLobe>(app) {
-        bevy::asset::embedded_asset!(app, "sheen_material.wesl");
-        bevy::asset::embedded_asset!(app, "sheen_functions.wesl");
+        bevy::shader::load_shader_library!(app, "sheen_functions.wesl");
     }
 }
 

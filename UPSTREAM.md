@@ -47,3 +47,10 @@ Left out: `assets/external`, `media`, `src` (`usdview`) and its dependency `mara
   tests expect a scene to finish projecting in one update. Under CPU load, about a third of 300 runs of one such test failed,
   and 14 tests failed across six runs of the suite. Its default is unbounded under `cfg(test)`, and all 644 tests then passed
   six runs under the same load. Outside tests it stays 10 ms.
+- **WESL modules imported only by name are loaded.** `import usd_bevy::route::gpu_instancing_types::...` needs that module
+  registered, and `embedded_asset!` only stores its bytes, while Bevy's loader follows asset-path imports and not package
+  ones. So `gpu_instancing_types`, `sheen_functions`, `strand_functions` and `flat_functions` now go through
+  `load_shader_library!`. Without it, the GPU instancer's pipeline waited for ever on an unresolved import.
+- **A material's shader bytes come before its plugin.** `flat_material`, `sheen_material`, `strand_material` and
+  `medium_material` added `MaterialPlugin` and then `embedded_asset!`, while the plugin's load runs on another thread. It
+  lost that race on some runs (`Path not found: usd_bevy/route/flat_material.wesl`), and the bytes now come first.
