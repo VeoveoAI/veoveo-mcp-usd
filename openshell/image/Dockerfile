@@ -5,8 +5,15 @@ FROM rust:1.99.0-trixie@sha256:6ff07edce8775d0f64be7aba9197229407301bddf2054d62c
 USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates clang cmake git pkg-config tzdata \
+        libvulkan1 libglvnd0 libgl1 libegl1 libglx0 libx11-6 libxext6 \
     && rm -rf /var/lib/apt/lists/* /var/log/apt /var/log/dpkg.log \
-    && rustup component add clippy rustfmt
+    && rustup component add clippy rustfmt \
+    && rustup target add wasm32-unknown-unknown \
+    && cargo install --locked wasm-bindgen-cli@0.2.129 \
+    && rm -rf /usr/local/cargo/registry
+# This repository renders on the GPU: under the nvidia runtime these ask for the device and
+# for the driver's Vulkan libraries, which the packages above let it load.
+ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=all
 # The persistent disk keeps fetched crates across restarts; cargo fetches pinned git
 # dependencies with git, which the policy admits.
 ENV CARGO_HOME=/sandbox/.cargo CARGO_NET_GIT_FETCH_WITH_CLI=true

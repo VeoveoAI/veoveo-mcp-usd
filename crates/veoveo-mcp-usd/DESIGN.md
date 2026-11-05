@@ -163,6 +163,10 @@ registration on every later start. A push that changes `openshell/image/`,
 template, gives the branch a new sandbox with an empty disk; any other push restarts
 it. The root `Dockerfile` stays the release and check build.
 
+This repository's image also opts in to the GPU, with `ENV NVIDIA_VISIBLE_DEVICES=all` and
+`ENV NVIDIA_DRIVER_CAPABILITIES=all` and the libraries the driver's Vulkan needs. Under the nvidia runtime that gives it the
+device, with no Kubernetes claim.
+
 ## Persistence
 
 | Table | Key | Retention |
