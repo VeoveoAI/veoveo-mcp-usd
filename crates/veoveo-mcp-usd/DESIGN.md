@@ -12,7 +12,13 @@ its items in its own PostgreSQL schema and serves them over MCP through
 
 `crates/usd_bevy` and `crates/usd_macro` are copied from `bevy_openusd`, with the tests' `assets/`, and
 [UPSTREAM.md](../../UPSTREAM.md) records the source commit and every change. They live in this workspace and pass its gate,
-except that they allow `clippy::all` so that they stay close to upstream. Nothing else in this repository depends on them yet.
+except that they allow `clippy::all` so that they stay close to upstream. The `render` subcommand is built on them.
+
+## Rendering
+
+One binary serves and renders. `veoveo-mcp-usd render STAGE FRAMES.txt` runs apart from the server because Bevy owns its
+process's main loop, so `main` dispatches it before it builds the server's runtime. It draws to a texture with no window,
+reads each frame back to a PNG, and exits with an error on a software adapter or a stage that shows no geometry.
 
 ## Service Identity
 
@@ -91,7 +97,8 @@ the skill it carries from the template:
 | Feature | Holds | Depends on |
 |---|---|---|
 | `contract` | `ItemId`, `ItemName`, `Items`, `UsdResource`, `UsdPermission`, the tool request and the results | `veoveo-types`, the SDK's `contract` feature, Serde and Schemars |
-| `server` (default) | The hosted server, the item store, the embedded skills and the binary | The SDK's `server` feature, core's store and skills, sqlx and rmcp |
+| `server` (default) | The hosted server, the item store, the embedded skills and the binary | The SDK's `server` feature, core's store and skills, sqlx and rmcp, and `render` |
+| `render` | The `render` subcommand | Bevy and `usd_bevy` |
 
 ### Modules
 
@@ -101,6 +108,7 @@ the skill it carries from the template:
 | `mcp` | The typed ready routes, resource readers, checked setup and registration declaration |
 | `store` | The `usd` schema's statements and the keyset listing |
 | `server` | Configuration, registration with the Hub, the database connection, the process instance and serving |
+| `render` | The `render` subcommand |
 
 ### Startup
 

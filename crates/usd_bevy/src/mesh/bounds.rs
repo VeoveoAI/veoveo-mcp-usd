@@ -7,6 +7,85 @@ use bevy::mesh::{
 };
 use bevy::{camera::primitives::Aabb, ecs::system::SystemParam, prelude::*};
 
+use crate::route::gpu_instancing::UsdInstancedDraw;
+
+/// The world bounds of everything visible: meshes, and draws on the GPU instancer, which
+/// have no mesh of their own to measure.
+#[derive(SystemParam)]
+pub struct StageBounds<'w, 's> {
+    bounds: MeshBounds<'w, 's>,
+    meshes: Query<
+        'w,
+        's,
+        (
+            &'static Mesh3d,
+            Option<&'static Aabb>,
+            &'static GlobalTransform,
+            &'static InheritedVisibility,
+            Option<&'static SkinnedMesh>,
+            Option<&'static MeshMorphWeights>,
+        ),
+    >,
+    instanced: Query<
+        'w,
+        's,
+        (
+            &'static Aabb,
+            &'static GlobalTransform,
+            &'static InheritedVisibility,
+            &'static UsdInstancedDraw,
+        ),
+    >,
+}
+
+impl StageBounds<'_, '_> {
+    /// Returns the lowest and highest corners, or None when nothing visible has bounds.
+    pub fn get(&self) -> Option<(Vec3, Vec3)> {
+        let meshes = self
+            .meshes
+            .iter()
+            .filter(|(.., visibility, _, _)| visibility.get())
+            .filter_map(|(mesh, aabb, transform, _, skin, morph)| {
+                self.bounds.get(mesh, transform, aabb, skin, morph)
+            });
+        let instanced = self
+            .instanced
+            .iter()
+            .filter(|(_, _, visibility, _)| visibility.get())
+            .filter_map(|(aabb, transform, _, _)| {
+                enclose(corners(aabb).map(|point| transform.transform_point(point)))
+            });
+        meshes
+            .chain(instanced)
+            .reduce(|(low, high), (min, max)| (low.min(min), high.max(max)))
+    }
+
+    /// How many meshes and instanced draws the world holds, visible or not.
+    pub fn draws(&self) -> usize {
+        self.meshes.iter().count() + self.instanced.iter().count()
+    }
+
+    /// How many instances the GPU instancer's draws cover, before culling.
+    pub fn instances(&self) -> usize {
+        self.instanced
+            .iter()
+            .map(|(_, _, _, draw)| draw.instance_count())
+            .sum()
+    }
+}
+
+/// The eight corners of a box.
+fn corners(bounds: &Aabb) -> impl Iterator<Item = Vec3> + '_ {
+    (0..8).map(|i| {
+        let sign = Vec3::new(
+            if i & 1 == 0 { -1.0 } else { 1.0 },
+            if i & 2 == 0 { -1.0 } else { 1.0 },
+            if i & 4 == 0 { -1.0 } else { 1.0 },
+        );
+        Vec3::from(bounds.center) + Vec3::from(bounds.half_extents) * sign
+    })
+}
+
 /// Samples current mesh bounds after global transforms and joint palettes update.
 #[derive(SystemParam)]
 pub struct MeshBounds<'w, 's> {
@@ -36,18 +115,7 @@ impl MeshBounds<'_, '_> {
             return None;
         }
         if skin.is_none() && morph.is_none() && mesh.is_none() {
-            let bounds = bounds?;
-            let points = (0..8).map(|i| {
-                let sign = Vec3::new(
-                    if i & 1 == 0 { -1.0 } else { 1.0 },
-                    if i & 2 == 0 { -1.0 } else { 1.0 },
-                    if i & 4 == 0 { -1.0 } else { 1.0 },
-                );
-                transform.transform_point(
-                    Vec3::from(bounds.center) + Vec3::from(bounds.half_extents) * sign,
-                )
-            });
-            return enclose(points);
+            return enclose(corners(bounds?).map(|point| transform.transform_point(point)));
         }
         let weights = match morph {
             Some(MeshMorphWeights::Value { weights }) => weights.as_slice(),

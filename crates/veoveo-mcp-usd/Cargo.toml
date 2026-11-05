@@ -26,6 +26,7 @@ contract = [
 # binary.
 server = [
     "contract",
+    "render",
     "veoveo-hub-sdk/server",
     "dep:anyhow",
     "dep:clap",
@@ -46,6 +47,9 @@ server = [
     "dep:veoveo-store",
 ]
 
+# Rendering a USD stage to images on the GPU: the binary's `render` subcommand.
+render = ["dep:anyhow", "dep:bevy", "dep:usd_bevy"]
+
 [build-dependencies]
 # Embeds the skills under skills/ at build time.
 veoveo-skills = { workspace = true, features = ["build"] }
@@ -59,6 +63,8 @@ veoveo-hub-sdk = { workspace = true, features = ["contract"], optional = true }
 veoveo-types = { workspace = true, optional = true }
 
 anyhow = { workspace = true, optional = true }
+bevy = { workspace = true, optional = true, features = ["multi_threaded", "bevy_window"] }
+usd_bevy = { path = "../usd_bevy", optional = true }
 clap = { workspace = true, optional = true }
 dotenvy = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }

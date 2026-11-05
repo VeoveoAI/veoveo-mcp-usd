@@ -103,6 +103,13 @@ The `check` stage checks the `.sqlx` metadata against a migrated PostgreSQL 18.6
 database, then runs rustfmt, clippy with warnings denied, cargo-deny, cargo-hack on each
 feature and the nextest `ci` profile. It runs the same way on macOS and Linux.
 
+## Rendering
+
+`veoveo-mcp-usd render STAGE FRAMES.txt` draws frames of a stage to PNG files on the GPU, with no window, and refuses a
+software adapter. Each line of `FRAMES.txt` is `TIME OUTPUT.png`, optionally followed by a camera's eye and focus. It
+prints `ADAPTER`, `BOUNDS`, `READY`, `FRAME` and `DONE` lines. Under Docker, `--runtime=nvidia` and the factory image's own
+`ENV` give it the GPU.
+
 ## Development environment
 
 ```sh

@@ -10,6 +10,8 @@ pub mod contract;
 
 #[cfg(feature = "server")]
 pub mod mcp;
+#[cfg(feature = "render")]
+pub mod render;
 #[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "server")]

@@ -21,6 +21,25 @@ veoveo-types = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "05b6c47
 # feature for hosting, registration and the forwarded identity.
 veoveo-hub-sdk = { git = "https://github.com/VeoveoAI/veoveo-hub-sdk", rev = "a9abfd20721bdb5588cfa632ec7b975f4036fec7", default-features = false }
 
+# Rendering, without a window on the server and in a canvas in the viewer.
+bevy = { version = "=0.20.1", default-features = false, features = [
+    "std",
+    "async_executor",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_light",
+    "bevy_mesh",
+    "bevy_camera",
+    "bevy_image",
+    "png",
+    "hdr",
+    "tonemapping_luts",
+    "zstd_rust",
+    "reflect_auto_register",
+] }
 anyhow = "=1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dotenvy = "0.15.7"
