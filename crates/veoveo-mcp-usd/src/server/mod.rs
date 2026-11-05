@@ -51,7 +51,7 @@ pub async fn run() -> Result<()> {
     }
     let _telemetry: TelemetryGuard =
         init_server_telemetry("veoveo-mcp-usd", "info,veoveo_mcp_usd=debug")?;
-    let app = AppHtml::load(&args.app_html)?;
+    let app = mcp::app_document().context("assembling the App's document")?;
     let registration::Registered {
         client,
         registration,

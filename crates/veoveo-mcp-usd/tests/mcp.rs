@@ -19,8 +19,7 @@ use veoveo_mcp_usd::{
 };
 
 fn app_html() -> AppHtml {
-    AppHtml::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/scenes.html"))
-        .expect("the App's document")
+    veoveo_mcp_usd::mcp::app_document().expect("the App's document")
 }
 
 /// A Hub that grants `granted` in front of the server. Nothing behind it answers a Hub route.

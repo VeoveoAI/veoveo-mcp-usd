@@ -47,6 +47,16 @@ pub const VIEWER_ROUTE: &str = "viewer/";
 /// a minute from every open browser fit.
 const VIEWER_REQUESTS_PER_MINUTE: u32 = 6000;
 
+/// The App's title.
+const APP_TITLE: &str = "USD scenes";
+/// What the App adds to the gallery.
+const APP_ADAPTER: &str = include_str!("../../assets/scenes.js");
+
+/// The App's document.
+pub fn app_document() -> std::io::Result<AppHtml> {
+    AppHtml::load(&veoveo_hub_ui::gallery_file(APP_TITLE, APP_ADAPTER)?)
+}
+
 pub fn force_setup() {
     LazyLock::force(&SERVER_SETUP);
 }
@@ -205,7 +215,7 @@ static ROUTES: LazyLock<Routes<UsdMcp>> = LazyLock::new(|| {
         )
         .app(
             AppBuilder::new(app(), APP_NAME)
-                .title("USD scenes")
+                .title(APP_TITLE)
                 .description("The USD scenes you can read, as a gallery. Choosing one shows a larger picture and opens it in the viewer.")
                 .policy(policy(UsdPermission::StagesRead))
                 .reader(|domain: UsdMcp, _| async move { Ok(domain.app.clone()) }),

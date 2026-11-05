@@ -131,9 +131,9 @@ Artifact and adds nothing to a person's library, which a render does.
 ### The Scene Browser
 
 `ui://usd/scenes` is a gallery of every scene in the repositories the person can read, grouped by repository, with `list_scenes` and
-`thumbnail`. A repository with no scene does not appear. Pictures load as cards come on screen, a few at a time. Choosing a scene shows its large
-picture with its facts, the previous and next scene, and Open, which is `ui/open-link` to `/view/lore/{repository}/{branch}/{path}`, so the
-Hub opens it in the viewer.
+`thumbnail`. A repository with no scene does not appear. The look and the behavior are [veoveo-hub-ui](https://github.com/VeoveoAI/veoveo-hub-ui)'s
+gallery, assembled at startup; `assets/scenes.js` says what is USD's. Open is `ui/open-link` to `/view/lore/{repository}/{branch}/{path}`, so the
+Hub opens a scene in the viewer.
 
 ### The Viewer
 
@@ -239,7 +239,6 @@ ClientInformation against exact metadata/key/Hub authority, preserving its origi
 private database grant only for that same verified registration. A missing/expired
 registration requires fresh trusted scoped admission, with no global-bootstrap fallback.
 
-`VEOVEO_VIEWER_DIRECTORY` names the viewer's built files and `VEOVEO_APP_HTML` the App's document. The App's document is read
 once at startup.
 
 ## Factory

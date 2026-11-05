@@ -34,6 +34,7 @@ server = [
     "dep:clap",
     "dep:dotenvy",
     "dep:futures",
+    "dep:veoveo-hub-ui",
     "dep:image",
     "dep:reqwest",
     "dep:rmcp",
@@ -85,6 +86,7 @@ sha2 = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
+veoveo-hub-ui = { workspace = true, optional = true }
 veoveo-mcp-artifact = { workspace = true, optional = true }
 veoveo-task = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
