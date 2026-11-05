@@ -85,3 +85,11 @@ opt-level = 3
 
 [profile.dev.package.bevy_mikktspace]
 opt-level = 3
+
+# The viewer's WASM, which every person downloads: small over fast to build.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

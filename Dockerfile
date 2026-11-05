@@ -25,6 +25,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         cargo-semver-checks@0.51.0 \
         cargo-insta@1.49.0 \
     && cargo install --locked sqlx-cli@0.9.0 --no-default-features --features postgres,rustls,sqlx-toml
+# The viewer builds for the browser. The bindgen release must equal Cargo.lock's wasm-bindgen.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    rustup target add wasm32-unknown-unknown \
+    && cargo install --locked wasm-bindgen-cli@0.2.129
 COPY env/profile.d/rust.sh /etc/profile.d/rust.sh
 # A development environment installs toolchains, components and crates, so the sandbox user owns them.
 RUN useradd --create-home --uid 1000 --shell /bin/bash sandbox \
@@ -72,6 +76,7 @@ RUN --mount=type=cache,id=veoveo-mcp-usd-cargo-registry,target=/usr/local/cargo/
     --mount=type=cache,id=veoveo-mcp-usd-target,target=/home/sandbox/src/target,uid=1000,sharing=locked \
     cargo fmt --check \
     && cargo clippy --locked --all-targets --all-features -- -D warnings \
+    && cargo clippy --locked --target wasm32-unknown-unknown -p usd-viewer -- -D warnings \
     && cargo deny --locked check \
     && cargo hack check --each-feature --no-dev-deps \
     && cargo nextest run --locked --profile ci

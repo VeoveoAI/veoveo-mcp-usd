@@ -12,13 +12,18 @@ its items in its own PostgreSQL schema and serves them over MCP through
 
 `crates/usd_bevy` and `crates/usd_macro` are copied from `bevy_openusd`, with the tests' `assets/`, and
 [UPSTREAM.md](../../UPSTREAM.md) records the source commit and every change. They live in this workspace and pass its gate,
-except that they allow `clippy::all` so that they stay close to upstream. The `render` subcommand is built on them.
+except that they allow `clippy::all` so that they stay close to upstream. The `render` subcommand and `crates/usd-viewer`
+are built on them.
 
 ## Rendering
 
 One binary serves and renders. `veoveo-mcp-usd render STAGE FRAMES.txt` runs apart from the server because Bevy owns its
 process's main loop, so `main` dispatches it before it builds the server's runtime. It draws to a texture with no window,
 reads each frame back to a PNG, and exits with an error on a software adapter or a stage that shows no geometry.
+
+`crates/usd-viewer` is the same library in the browser, on WebGPU only: WebGL2 is not compiled in. It loads the stage its
+page's `scene` query names, by path on its own origin, with no sidecar requests, and reports to its parent page as
+`{"usdViewer":{"state":...}}` messages: `started`, `loading`, `ready`, `measured` and `failed`.
 
 ## Service Identity
 

@@ -17,8 +17,9 @@ domain, which the USD server replaces.
 | `.config/nextest.toml` | Test profiles for local runs and machine-readable results |
 | `.cargo/config.toml` | `SQLX_OFFLINE`, so every build reads the committed query metadata |
 | `.sqlx/` | sqlx's checked metadata for every query the workspace compiles |
-| `crates/usd_bevy/`, `crates/usd_macro/`, `assets/`, `upstream-examples/`, `UPSTREAM.md` | OpenUSD for Bevy, copied from `bevy_openusd`, and what we changed |
+| `crates/usd_bevy/`, `crates/usd_macro/`, `assets/`, `UPSTREAM.md` | OpenUSD for Bevy, copied from `bevy_openusd`, and what we changed |
 | `crates/veoveo-mcp-usd/` | The server: its contract, MCP surface, store, binary, migrations, tests and the documents it serves |
+| `crates/usd-viewer/` | The WASM viewer, on WebGPU: it loads a stage by path on its own origin and orbits it |
 | `crates/*/migrations/` | The server's schema, applied in its own PostgreSQL schema at startup |
 
 ## Server
@@ -100,15 +101,28 @@ docker build --target check .
 ```
 
 The `check` stage checks the `.sqlx` metadata against a migrated PostgreSQL 18.6
-database, then runs rustfmt, clippy with warnings denied, cargo-deny, cargo-hack on each
-feature and the nextest `ci` profile. It runs the same way on macOS and Linux.
+database, then runs rustfmt, clippy with warnings denied, on the workspace and on the viewer for
+wasm32, cargo-deny, cargo-hack on each feature and the nextest `ci` profile. It runs the
+same way on macOS and Linux.
 
-## Rendering
+## Rendering and the viewer
 
 `veoveo-mcp-usd render STAGE FRAMES.txt` draws frames of a stage to PNG files on the GPU, with no window, and refuses a
 software adapter. Each line of `FRAMES.txt` is `TIME OUTPUT.png`, optionally followed by a camera's eye and focus. It
 prints `ADAPTER`, `BOUNDS`, `READY`, `FRAME` and `DONE` lines. Under Docker, `--runtime=nvidia` and the factory image's own
 `ENV` give it the GPU.
+
+The viewer builds in the `dev` environment:
+
+```sh
+cargo build --locked --profile wasm-release --target wasm32-unknown-unknown -p usd-viewer
+wasm-bindgen --target web --no-typescript --remove-name-section --remove-producers-section \
+    --out-name usd_viewer --out-dir site \
+    target/wasm32-unknown-unknown/wasm-release/usd-viewer.wasm
+cp crates/usd-viewer/web/index.html site/
+```
+
+Serve `site/` and the stage from one origin and open `index.html?scene=PATH/TO/STAGE.usdz`.
 
 ## Development environment
 

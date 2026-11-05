@@ -1,0 +1,23 @@
+[package]
+name = "usd-viewer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+repository.workspace = true
+publish.workspace = true
+description = "The USD viewer: usd_bevy as WASM in a browser, on WebGPU."
+
+[lints]
+workspace = true
+
+# Bevy's derive macros find it in this table alone, so it is here for every target.
+[dependencies]
+bevy.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { workspace = true, features = ["bevy_window", "bevy_winit", "webgpu"] }
+usd_bevy = { path = "../usd_bevy" }
+js-sys = "=0.3.106"
+wasm-bindgen = "=0.2.129"
+web-sys = { version = "=0.3.106", features = ["Location", "Performance", "UrlSearchParams", "Window"] }

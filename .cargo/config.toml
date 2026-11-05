@@ -2,3 +2,7 @@
 # `cargo sqlx prepare` sets SQLX_OFFLINE=false itself, which takes precedence.
 [env]
 SQLX_OFFLINE = "true"
+
+# getrandom's browser backend, for the viewer.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg=getrandom_backend="wasm_js"']

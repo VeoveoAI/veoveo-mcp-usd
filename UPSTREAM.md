@@ -1,6 +1,6 @@
 # Upstream
 
-`crates/usd_bevy`, `crates/usd_macro`, `assets/` and `upstream-examples/` are copied from
+`crates/usd_bevy`, `crates/usd_macro` and `assets/` are copied from
 [`openusd-rs/bevy_openusd`](https://github.com/openusd-rs/bevy_openusd), MIT, on its `develop` branch at
 `5b3ebbc7e4e5da0808dcf3898df96c5d4a63b583`. Its `LICENSE` stays beside each. This is a copy and not a fork or a dependency, so an upstream change reaches
 this repository only when someone copies it here and records it below.
@@ -13,7 +13,7 @@ this repository only when someone copies it here and records it below.
 | `crates/usd_macro/` | `crates/usd_macro/` |
 | The top-level files of `assets/` | `assets/`, where the crate's tests read them |
 | `examples/gif_frames.rs` | Ported to `crates/veoveo-mcp-usd/src/render.rs`, the `render` subcommand |
-| `examples/web/` | `upstream-examples/web/`, not built yet, the start of the WASM viewer |
+| `examples/web/` | Ported to `crates/usd-viewer/`, the WASM viewer, with upstream's `LICENSE` |
 
 Left out: `assets/external`, `media`, `src` (`usdview`) and its dependency `mara`, `benchmarks`, `scripts` and
 `vendor/bevy_asset`.
@@ -57,6 +57,8 @@ Left out: `assets/external`, `media`, `src` (`usdview`) and its dependency `mara
 - **`mesh::bounds::StageBounds`, new.** The bounds of everything visible, including the GPU instancer's draws, which have no
   mesh to measure. The render and the viewer frame a stage with it. `examples/gif_frames.rs`, which measures meshes alone,
   would wait for ever on a stage whose instancers are all on the GPU.
+- **`editor/reload.rs` is native only where it watches files.** `WatchState`, `watch` and `SystemTime` are behind
+  `cfg(not(target_arch = "wasm32"))`, because they are unused on wasm and rustc warnings fail our gate.
 
 The ports differ from the examples in these ways:
 
@@ -64,3 +66,5 @@ The ports differ from the examples in these ways:
   starve materials. On `hummingbird.usdz` it left every frame blank until the first time change. A batch render has no frame
   rate to protect, so the render leaves Bevy's default, no cap.
 - **The render** drops the overlays, the streaming mode and `usdview`'s environment, and refuses a software adapter.
+- **The viewer** loads one stage, named by its page's `scene` query, by path on its own origin. It drops the in-memory
+  showcase and adds framing, and it reports its progress to its parent page.
