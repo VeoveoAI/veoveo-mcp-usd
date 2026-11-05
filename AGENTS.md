@@ -1,0 +1,88 @@
+# Agent Instructions
+
+These rules apply to this repository. The
+crate's own rules are in
+[`crates/veoveo-mcp-usd/AGENTS.md`](crates/veoveo-mcp-usd/AGENTS.md).
+
+- The design is in [crates/veoveo-mcp-usd/DESIGN.md](crates/veoveo-mcp-usd/DESIGN.md). Change it in the
+  same change as the code.
+- Use upstream runtimes such as PostgreSQL unmodified. Adapt through
+  supported configuration.
+- Prefer strong types: typed structs, enums and domain identifiers over raw strings and
+  JSON wherever the shape is known.
+- MCP comes from [veoveo-hub-sdk](https://github.com/VeoveoAI/veoveo-hub-sdk): hosting, registration with the Hub,
+  the forwarded identity, permission requirements, the documents and contract
+  resources, subscriptions, the MCP Tasks adapter and calls to other servers. Depend on
+  it by Git revision. veoveo-core holds no MCP; take types, the store, Tasks, usage and audit
+  from it.
+- How an agent uses the server is in its skills, `skills/{name}/SKILL.md` and the files
+  beside it, embedded by `build.rs` and served at `skill://{slug}/{name}/{path}`, as the
+  design's [Skills](crates/veoveo-mcp-usd/DESIGN.md#skills) describes. The
+  `instructions` say what the server is and name each skill's address; tool and resource
+  descriptions say only what each does. Skill text names tools as callers see them
+  through the Hub, `{slug}__{tool}`.
+- A server that calls another server depends on that server's `contract` feature by Git
+  revision, declares the permissions it calls with through
+  the ready route builder’s `uses`, and calls through `ctx.client()` in a handler or
+  `ServerCalls::for_task` in a Task worker, as the SDK's
+  [calls to other servers](https://github.com/VeoveoAI/veoveo-hub-sdk/blob/main/crates/veoveo-hub-sdk/DESIGN.md#calls-to-other-servers)
+  describe. A server whose tools others call publishes each tool's request as a
+  `ToolCall` in its own `contract` feature.
+- Run Tasks through the SDK's `TaskWorker`, whose handler receives the Task's `ctx`, as
+  the SDK's [Task work](https://github.com/VeoveoAI/veoveo-hub-sdk/blob/main/crates/veoveo-hub-sdk/DESIGN.md#task-work) describes. Wrap work a restarted Task must not
+  repeat in `ctx.step`, which returns a finished step's stored result.
+- Work handed to an outside provider is an operation. `ctx.operation(..).dispatch`
+  records it before the call and gives the provider an idempotency key and a callback
+  URL; `ctx.wait` parks the Task until the provider's event reaches the callback route
+  that `hosting::operations::operation_callbacks` serves, a status check runs or the
+  deadline passes. The server writes only the provider's calls and its
+  `ProviderEvents` parser, which checks the provider's signature.
+- A server that consumes metered or billed resources declares its usage kinds from a
+  closed enum at startup through `UsageLedger::declare`, each with its FOCUS service
+  category and unit, records an estimate with `ctx.usage()` before the work and the
+  actual usage when the provider reports it. Core's
+  [usage ledger](https://github.com/VeoveoAI/veoveo-core/blob/9a6b3ff95469ff19f9ccb513421a57ba6751aa9e/platform/usage/DESIGN.md) holds the records.
+- Audit classes are the server's own, `<slug>.<action>`, each mapped to an OCSF class.
+  A record's reason is a code the server defines and its target a URI in the server's
+  own scheme, as core's
+  [audit record contract](https://github.com/VeoveoAI/veoveo-core/blob/9a6b3ff95469ff19f9ccb513421a57ba6751aa9e/platform/audit/contract/DESIGN.md#outcome-and-reason)
+  describes.
+- The server owns one PostgreSQL schema named after its slug and applies the crate's
+  `migrations/` there at startup. Never edit an applied migration; add a new one.
+- Server SQL touches only the server's own schema. It never reads, joins or references
+  core's schemas (`tasks`, `usage`, `audit`, `identity`, `kernel`): core's state comes
+  only through the SDK and core's runtime API. `tests/sql_confinement.rs` checks it.
+  When the API lacks what the server needs, report the gap to core and the SDK instead
+  of working around it in the server.
+- Every SQL statement is a `.sql` file beside the code that runs it, run through sqlx's
+  checked `query_file*!` macros. Builds read the committed `.sqlx` metadata, because
+  `.cargo/config.toml` sets `SQLX_OFFLINE`. After changing a query or a migration,
+  regenerate the metadata from an empty target directory.
+- Statements and tables follow the server schema rules of veoveo-core's
+  [database design](https://github.com/VeoveoAI/veoveo-core/blob/9a6b3ff95469ff19f9ccb513421a57ba6751aa9e/docs/DATABASE.md),
+  which `crates/veoveo-mcp-usd/tests/database_conformance.rs` checks. A statement binds its tenant, bounds its
+  rows and reaches them through an index in a generic plan. A table has a primary key,
+  an index whose leading columns are each foreign key's, and a
+  `COMMENT ON TABLE … IS 'Retention: …'`. A statement that cannot comply carries a
+  `-- veoveo:` marker that states its reason.
+- Construct listings with core's `Collection`, `PageSize` and `Pager`, bound to the
+  collection, tenant and effective selection, with one statement for the first page and one
+  for the pages after a cursor. Do not write a `$cursor IS NULL OR …` predicate, which
+  loses the index seek in a cached generic plan.
+- Keep test logic in Rust and tool behavior in each tool's own configuration. Do not add
+  a task runner or shell scripts that hold test logic.
+- Pin exact versions and image digests. When changing a pin, verify the latest stable
+  release at its source.
+- Run `docker build --target check .` on macOS and on Linux before pushing. The `check`
+  and `build` stages keep Cargo's registry, its Git checkouts and the workspace `target/`
+  in BuildKit cache mounts, so consecutive checks reuse compiled crates. These caches
+  live only in the build host's BuildKit, are built by the operator from our own
+  repositories, and are never used by factory builds, which share no writable cache.
+- Names, identifiers and formats follow the
+  [naming and format conventions](https://github.com/VeoveoAI/veoveo-core/blob/main/docs/CONVENTIONS.md),
+  and MCP names follow the SDK's
+  [MCP naming conventions](https://github.com/VeoveoAI/veoveo-hub-sdk/blob/main/docs/CONVENTIONS.md).
+  Where a standard governs a name or format, follow it; extend a standard only through
+  its own extension mechanism. URIs, paths and identifiers carry no version segment such
+  as `/v1`; releases carry versions.
+- Commit small, coherent changes. Commits carry no AI or tool attribution.

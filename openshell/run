@@ -1,0 +1,9 @@
+#!/bin/sh
+# Builds this branch, then replaces itself with the server. The installation runs it
+# from the branch's checkout after every fetch and supplies the server's deployment,
+# Hub and registration settings in the environment.
+set -e
+cargo build --locked --release --bin veoveo-mcp-usd
+export VEOVEO_KEY_DIRECTORY=/sandbox/state/keys
+mkdir -p "$VEOVEO_KEY_DIRECTORY"
+exec target/release/veoveo-mcp-usd

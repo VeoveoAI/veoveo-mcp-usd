@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/VeoveoAI/veoveo-mcp-usd"
+publish = false
+
+[workspace.dependencies]
+tempfile = "=3.27.0"
+# veoveo-core, pinned to one revision for every core crate.
+veoveo-fixtures = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "05b6c47540680e085cc5356ed4ba8742ecc78bff" }
+veoveo-skills = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "05b6c47540680e085cc5356ed4ba8742ecc78bff" }
+veoveo-store = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "05b6c47540680e085cc5356ed4ba8742ecc78bff" }
+veoveo-types = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "05b6c47540680e085cc5356ed4ba8742ecc78bff" }
+# The Rust SDK for Veoveo MCP servers: the contract feature for declarations, the server
+# feature for hosting, registration and the forwarded identity.
+veoveo-hub-sdk = { git = "https://github.com/VeoveoAI/veoveo-hub-sdk", rev = "a9abfd20721bdb5588cfa632ec7b975f4036fec7", default-features = false }
+
+anyhow = "=1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dotenvy = "0.15.7"
+# The SDK's HTTP client release; registration and the tests share it.
+reqwest = { version = "=0.13.5", default-features = false }
+# The rmcp fork the SDK pins; the tool router uses its macros.
+rmcp = { version = "=3.8.0", git = "https://github.com/VeoveoAI/rust-sdk", rev = "d45f7f5e43e910f818400ca702cc904c5682c213" }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+secrecy = "0.10.3"
+tracing = "0.1.44"
+url = "=2.5.8"
+
+schemars = { version = "1.2.2", features = ["uuid1"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+# PostgreSQL 18 through the same sqlx release and features as veoveo-core. `sqlx-toml`
+# reads the crate's migration table from its `sqlx.toml`.
+sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots", "uuid", "chrono", "json", "migrate", "macros", "sqlx-toml"] }
+thiserror = "=2.0.21"
+tokio = "1.53.1"
+# The exact release veoveo-types pins.
+uuid = { version = "=1.25.0", default-features = false, features = ["serde", "std", "v7"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
