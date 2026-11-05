@@ -32,6 +32,9 @@ use crate::{
 
 /// Where the framed camera starts, as yaw and pitch around the stage's center.
 const VIEW: (f32, f32) = (0.6, -0.45);
+/// How far the framed camera stands, in the stage's largest extents: Bevy's default field of view
+/// shows a whole extent from 1.21 of them, with a margin here for its depth.
+const FRAMED_DISTANCE: f32 = 1.4;
 /// How long the viewer counts frames, once the stage is ready, before reporting a rate.
 const MEASURE_SECONDS: f32 = 5.0;
 /// Frames drawn after a new time before the viewer says it shows: one to sample, one to draw.
@@ -254,7 +257,7 @@ fn frame_stage(
     let span = (high - low).max_element();
     for (mut orbit, mut projection) in &mut cameras {
         orbit.focus = (low + high) * 0.5;
-        orbit.distance = span * 1.1;
+        orbit.distance = span * FRAMED_DISTANCE;
         orbit.range = (span * 0.02, span * 8.0);
         if let Projection::Perspective(perspective) = projection.as_mut() {
             perspective.far = span * 16.0;

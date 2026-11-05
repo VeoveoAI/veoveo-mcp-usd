@@ -6,6 +6,7 @@ mod tasks;
 
 use rmcp::{ErrorData as McpError, RoleServer, model::ClientCapabilities, service::RequestContext};
 use std::sync::LazyLock;
+use usd_bevy::instance::UsdInstanceOverrides;
 use veoveo_hub_sdk::{
     apps::{AppHtml, AppUri, UiVisibility},
     calls::ToolCall,
@@ -75,10 +76,11 @@ impl UsdMcp {
     ) -> Result<SceneListing, ToolError> {
         let reader = self.reader(&context)?;
         let Some(repository) = request.repository else {
-            let repositories = reader
+            let mut repositories = reader
                 .repositories()
                 .await
                 .map_err(|error| refused("listing your repositories", error))?;
+            repositories.sort_by_key(|repository| repository.name.to_lowercase());
             return Ok(SceneListing {
                 repositories: repositories
                     .into_iter()
@@ -119,6 +121,7 @@ impl UsdMcp {
             &request.branch,
             &request.path,
             Scope::Layers,
+            &UsdInstanceOverrides::default(),
         )
         .await
         .map_err(stage_refused)?;

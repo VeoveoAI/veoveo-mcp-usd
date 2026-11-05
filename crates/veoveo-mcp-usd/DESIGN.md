@@ -82,8 +82,8 @@ The Hub decides each call. A refusal reaches the agent with its status and probl
 what it read.
 
 `stage::gather` starts from the root's bytes and composes them with `usd_bevy`'s `UsdSource::from_memory`, which names the
-dependencies the stage asks for and does not have. It fetches those, by their paths relative to the repository's top, and
-composes again until nothing it can fetch is missing. A dependency Lore does not hold stays listed as missing, and an
+dependencies the stage asks for, under the variants a render chose, and does not have. It fetches those, by their paths
+relative to the repository's top, and composes again until nothing it can fetch is missing. A dependency Lore does not hold stays listed as missing, and an
 `inspect_stage` still reports the rest. Inspecting needs only layers, so it fetches files of the USD extensions; rendering
 needs textures too, so it fetches everything. Composition runs on a blocking thread, since a stage is not `Send`.
 

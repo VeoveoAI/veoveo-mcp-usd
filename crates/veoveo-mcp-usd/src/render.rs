@@ -52,6 +52,9 @@ const WARMUP: u32 = 30;
 const SETTLE: u32 = 3;
 /// Where the framed camera looks from, relative to the stage's center.
 const VIEW: Vec3 = Vec3::new(0.7, 0.45, 1.0);
+/// How far the framed camera stands, in the stage's largest extents: Bevy's default field of view
+/// shows a whole extent from 1.21 of them, with a margin here for its depth.
+const FRAMED_DISTANCE: f32 = 1.4;
 /// Frames a ready stage may show nothing before the render gives up on it.
 const EMPTY: u32 = 120;
 
@@ -404,9 +407,10 @@ fn record(
             .map_or(0.0, openusd::usd::Stage::start_time_code);
         let time = frame.time.unwrap_or(start);
         let look = match &frame.camera {
-            FrameCamera::Stage => {
-                Some((fit.center + VIEW.normalize() * fit.span * 1.1, fit.center))
-            }
+            FrameCamera::Stage => Some((
+                fit.center + VIEW.normalize() * fit.span * FRAMED_DISTANCE,
+                fit.center,
+            )),
             FrameCamera::Look(eye, focus) => Some((*eye, *focus)),
             FrameCamera::Prim(_) => None,
         };

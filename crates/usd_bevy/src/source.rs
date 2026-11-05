@@ -466,9 +466,28 @@ impl UsdSource {
     /// lacks. In-memory paths come back relative, as `from_memory` takes them;
     /// sources that fall back to the filesystem report none.
     pub fn missing_dependencies(&self) -> Vec<String> {
+        Self::relative_to_memory(self.probe_stage().1)
+    }
+
+    /// [`Self::missing_dependencies`] with `overrides` applied, for a variant can
+    /// name files the default selections do not.
+    pub fn missing_dependencies_under(
+        &self,
+        overrides: &crate::instance::UsdInstanceOverrides,
+    ) -> Vec<String> {
+        let requests = Arc::new(Mutex::new(BTreeSet::new()));
+        if let Ok(stage) = self.open_tracked(requests.clone(), None, false)
+            && overrides.apply(&stage).is_ok()
+        {
+            let _ = Self::validate_composition(&stage);
+        }
+        let missing = std::mem::take(&mut *requests.lock().expect("dependency requests"));
+        Self::relative_to_memory(missing)
+    }
+
+    fn relative_to_memory(identifiers: BTreeSet<String>) -> Vec<String> {
         let base = absolute(Path::new(MEMORY_ROOT)).ok();
-        self.probe_stage()
-            .1
+        identifiers
             .into_iter()
             .map(|identifier| {
                 base.as_ref()

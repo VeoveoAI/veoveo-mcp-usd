@@ -6,7 +6,7 @@ use std::{
 };
 
 use futures::{StreamExt as _, TryStreamExt as _, stream};
-use usd_bevy::UsdSource;
+use usd_bevy::{UsdSource, instance::UsdInstanceOverrides};
 
 use crate::{
     contract::{
@@ -129,14 +129,15 @@ pub async fn scenes(
     Ok(found.into_iter().flatten().collect())
 }
 
-/// Reads `path` and then what it names, composing again after each round until nothing it
-/// may fetch is missing.
+/// Reads `path` and then what it names under `overrides`, composing again after each round until
+/// nothing it may fetch is missing.
 pub async fn gather(
     reader: &Reader,
     repository: &RepositoryId,
     branch: &BranchName,
     path: &StagePath,
     scope: Scope,
+    overrides: &UsdInstanceOverrides,
 ) -> Result<Gathered, StageError> {
     let root = reader.file(repository, branch, path.as_str()).await?;
     let mut gathered = Gathered {
@@ -147,7 +148,7 @@ pub async fn gather(
         revision: root.revision,
     };
     for _ in 0..MAX_ROUNDS {
-        let wanted = wanted(&mut gathered, scope).await?;
+        let wanted = wanted(&mut gathered, scope, overrides).await?;
         if wanted.is_empty() {
             return Ok(gathered);
         }
@@ -178,9 +179,14 @@ pub async fn gather(
 
 /// What to fetch next: what the composed stage asks for that is not held and may be fetched.
 /// What may not be fetched goes in `missing`.
-async fn wanted(gathered: &mut Gathered, scope: Scope) -> Result<Vec<String>, StageError> {
+async fn wanted(
+    gathered: &mut Gathered,
+    scope: Scope,
+    overrides: &UsdInstanceOverrides,
+) -> Result<Vec<String>, StageError> {
     let source = gathered.source()?;
-    let asked = tokio::task::spawn_blocking(move || source.missing_dependencies())
+    let overrides = overrides.clone();
+    let asked = tokio::task::spawn_blocking(move || source.missing_dependencies_under(&overrides))
         .await
         .map_err(|error| StageError::Compose(error.to_string()))?;
     let mut wanted = Vec::new();
@@ -398,13 +404,57 @@ def Xform "World" (
 
     #[tokio::test]
     async fn composing_names_what_the_stage_still_lacks() {
+        let none = UsdInstanceOverrides::default();
         let mut held = gathered(&[("a/a.usda", ROOT)]);
         assert_eq!(
-            wanted(&mut held, Scope::Layers).await.unwrap(),
+            wanted(&mut held, Scope::Layers, &none).await.unwrap(),
             ["a/part.usda"]
         );
         let mut held = gathered(&[("a/a.usda", ROOT), ("a/part.usda", PART)]);
-        assert!(wanted(&mut held, Scope::Layers).await.unwrap().is_empty());
+        assert!(
+            wanted(&mut held, Scope::Layers, &none)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chosen_variant_names_what_only_it_refers_to() {
+        const VARIANTS: &str = r#"#usda 1.0
+def Xform "World" (
+    variantSets = "look"
+    variants = { string look = "plain" }
+)
+{
+    variantSet "look" = {
+        "plain" { }
+        "fancy" {
+            def Xform "Extra" (
+                prepend references = @./extra.usda@</Part>
+            )
+            {
+            }
+        }
+    }
+}
+"#;
+        let none = UsdInstanceOverrides::default();
+        let mut held = gathered(&[("a/a.usda", VARIANTS)]);
+        assert!(
+            wanted(&mut held, Scope::Layers, &none)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let chosen = UsdInstanceOverrides {
+            variants: vec![("/World".into(), "look".into(), "fancy".into())],
+            attributes: vec![],
+        };
+        assert_eq!(
+            wanted(&mut held, Scope::Layers, &chosen).await.unwrap(),
+            ["a/extra.usda"]
+        );
     }
 
     #[tokio::test]

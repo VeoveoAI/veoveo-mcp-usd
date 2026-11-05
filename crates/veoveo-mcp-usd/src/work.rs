@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Map, json};
 use tokio_util::sync::CancellationToken;
+use usd_bevy::instance::UsdInstanceOverrides;
 use veoveo_hub_sdk::{
     HubProfileId,
     definition::Product,
@@ -135,6 +136,20 @@ async fn render_and_store(
         &request.branch,
         &request.path,
         Scope::Everything,
+        &UsdInstanceOverrides {
+            variants: request
+                .variants
+                .iter()
+                .map(|choice| {
+                    (
+                        choice.prim.to_string(),
+                        choice.set.clone(),
+                        choice.selection.clone(),
+                    )
+                })
+                .collect(),
+            attributes: vec![],
+        },
     )
     .await
     .context("reading the stage")?;
@@ -273,8 +288,10 @@ async fn draw(
             .arg(&choice.selection);
     }
     command
-        // The child holds no credential of the server's.
+        // The child holds no credential of the server's, and a failure says only why it failed.
         .env_remove("VEOVEO_REGISTRATION_SECRET")
+        .env("RUST_LOG", "error")
+        .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

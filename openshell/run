@@ -1,6 +1,9 @@
 #!/bin/sh
 # Builds the viewer and the server in the branch's checkout, then runs the server.
 set -e
+# The template's CPU limit, which cargo cannot read from inside the sandbox. Left to itself it starts
+# a job for each of the node's cores, which took the first build to 7.7 of the sandbox's 8 GiB.
+export CARGO_BUILD_JOBS=4
 cargo build --locked --profile wasm-release --target wasm32-unknown-unknown -p usd-viewer
 wasm-bindgen --target web --no-typescript --remove-name-section --remove-producers-section \
     --out-dir target/viewer --out-name usd_viewer \

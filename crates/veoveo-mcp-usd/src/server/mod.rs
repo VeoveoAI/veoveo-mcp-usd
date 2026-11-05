@@ -120,8 +120,15 @@ async fn serve(
         },
         stop.clone(),
     ));
+    // The Hub reaches the viewer's route with its own host, the public base's.
+    let public_base = registration
+        .public_base()
+        .context("the Hub named no public base for the viewer")?;
+    let deployment = deployment
+        .clone()
+        .with_public_base(Some(public_base.clone()));
     let hosted = HostedServer::for_domain::<UsdMcp>()
-        .deployment(deployment, args.allow_loopback_hosts)?
+        .deployment(&deployment, args.allow_loopback_hosts)?
         .allowed_hosts(args.allowed_hosts.iter().cloned())
         .internal_trust(registration.access_tokens(), http)?
         .handler(move || {

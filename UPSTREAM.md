@@ -81,4 +81,5 @@ ran on every animated prim at every new time, and its memo's key held the time.
 | `src/route/material.rs` | `ProjectionMaterials` keys a material none of whose inputs vary under no time. `across_times` keeps a memo for a root that samples new times, emptied when the stage changes, and `begin_time` forgets varying results of earlier times |
 | `src/instance.rs` | `tick` samples new times with that memo, kept on the root as `sampling_materials`. `UsdInstances::load_payload` and `unload_payload` reach a root's live stage, for the viewer's panel |
 | `src/live.rs`, `src/asset.rs` | A finished projection job hands its memo to the root, so the first new time resolves nothing again |
+| `src/source.rs` | `UsdSource::missing_dependencies_under` names what a stage asks for under chosen variants, which can name files the default selections do not |
 | `src/route/sampling.rs` | 8-bit mip chains are built in place from the level above, through tables of sRGB light, with no `f32` copy of a level. The copy took four bytes for each channel of the top level, which is memory a browser never gives back, and most of a load's CPU |
