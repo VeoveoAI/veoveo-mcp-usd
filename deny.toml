@@ -27,7 +27,11 @@ allow = [
 ]
 confidence-threshold = 0.9
 # notify, through bevy_asset's file watcher: CC0-1.0 dedicates the code to the public domain.
-exceptions = [{ crate = "notify", allow = ["CC0-1.0"] }]
+# epaint_default_fonts, through the viewer's panels: the fonts they draw with.
+exceptions = [
+    { crate = "notify", allow = ["CC0-1.0"] },
+    { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+]
 
 [licenses.private]
 ignore = true

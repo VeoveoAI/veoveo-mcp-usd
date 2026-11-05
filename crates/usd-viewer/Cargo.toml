@@ -17,7 +17,12 @@ bevy.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 bevy = { workspace = true, features = ["bevy_window", "bevy_winit", "webgpu"] }
+bevy_egui = { version = "=0.43.0", default-features = false, features = ["render", "default_fonts"] }
 usd_bevy = { path = "../usd_bevy" }
+openusd = { git = "https://github.com/mxpv/openusd", rev = "d10fa4c2838e1e18a5c4fb4aa47534f94fde8995" }
 js-sys = "=0.3.106"
+serde = { workspace = true }
+serde_json = { workspace = true }
 wasm-bindgen = "=0.2.129"
-web-sys = { version = "=0.3.106", features = ["Location", "Performance", "UrlSearchParams", "Window"] }
+wasm-bindgen-futures = "=0.4.79"
+web-sys = { version = "=0.3.106", features = ["Location", "Performance", "Response", "UrlSearchParams", "Window"] }

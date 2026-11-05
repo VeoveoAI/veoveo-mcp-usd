@@ -46,6 +46,20 @@ pub(super) struct Args {
         default_value = "/var/lib/veoveo/usd/keys"
     )]
     pub key_directory: PathBuf,
+    /// The viewer's built files, which the public route serves.
+    #[arg(
+        long,
+        env = "VEOVEO_VIEWER_DIRECTORY",
+        default_value = "/usr/share/veoveo/usd/viewer"
+    )]
+    pub viewer_directory: PathBuf,
+    /// The App document served as `ui://usd/scenes`, read once at startup.
+    #[arg(
+        long,
+        env = "VEOVEO_APP_HTML",
+        default_value = "/usr/share/veoveo/usd/scenes.html"
+    )]
+    pub app_html: PathBuf,
     #[arg(long, env = "VEOVEO_ALLOW_LOOPBACK_HOSTS", default_value_t = false)]
     pub allow_loopback_hosts: bool,
     #[arg(

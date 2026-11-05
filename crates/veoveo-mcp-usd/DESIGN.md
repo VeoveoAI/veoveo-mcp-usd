@@ -1,29 +1,26 @@
 # USD MCP Design
 
-This document is the design and operational contract for the `veoveo-mcp-usd`
-crate. The server still carries the template's item domain, which the USD server replaces.
+This document is the design and operational contract for the `veoveo-mcp-usd` crate.
 
-For now it keeps a list of named items for each tenant. A caller creates an item with
-a tool, reads it at its address and pages through the tenant's items. The server holds
-its items in its own PostgreSQL schema and serves them over MCP through
-`veoveo-hub-sdk`.
+The server shows USD stages that live in Lore repositories, to people and to agents. It lists the scenes a person can
+read, reports what a stage holds, renders a stage to a PNG in Artifact on the GPU, and serves the WASM viewer the Hub opens
+a USD file with. It reads every scene as the person who asked, through the Hub, so Lore's rules decide each read.
+
+A scene is an ordinary folder at the top level of a repository, whose root stage is `{folder}/{folder}.usd`, `.usda`,
+`.usdc` or `.usdz`. There is no manifest. The files are ordinary Lore files, pushed with Lore.
 
 ## Copied Crates
 
 `crates/usd_bevy` and `crates/usd_macro` are copied from `bevy_openusd`, with the tests' `assets/`, and
 [UPSTREAM.md](../../UPSTREAM.md) records the source commit and every change. They live in this workspace and pass its gate,
-except that they allow `clippy::all` so that they stay close to upstream. The `render` subcommand and `crates/usd-viewer`
-are built on them.
+except that they allow `clippy::all` so that they stay close to upstream. The `render` subcommand, the stage reads and
+`crates/usd-viewer` are built on them.
 
-## Rendering
-
-One binary serves and renders. `veoveo-mcp-usd render STAGE FRAMES.txt` runs apart from the server because Bevy owns its
-process's main loop, so `main` dispatches it before it builds the server's runtime. It draws to a texture with no window,
-reads each frame back to a PNG, and exits with an error on a software adapter or a stage that shows no geometry.
-
-`crates/usd-viewer` is the same library in the browser, on WebGPU only: WebGL2 is not compiled in. It loads the stage its
-page's `scene` query names, by path on its own origin, with no sidecar requests, and reports to its parent page as
-`{"usdViewer":{"state":...}}` messages: `started`, `loading`, `ready`, `measured` and `failed`.
+`openusd` comes from upstream by Git revision, since the copy needs commits past its last release (`d10fa4c` is 217 commits
+past `v0.8.0`). A Git dependency brings its submodules, so a cold `cargo fetch` of this workspace takes about 25 s and leaves
+a 528 MB checkout on the sandbox's disk, 480 MB of it upstream's test assets. A sandbox's disk keeps it between
+restarts. Cargo has no setting that skips a submodule, and `submodule.*.update=none` in the global Git configuration did not
+stop it. A release of `openusd` that holds these commits ends this.
 
 ## Service Identity
 
@@ -33,8 +30,9 @@ binary       veoveo-mcp-usd
 repository   veoveo-mcp-usd
 slug         usd
 URI scheme   usd
-permissions  usd.items.read, usd.items.write
+permissions  usd.stages.read, usd.stages.render
 MCP          /usd/mcp
+viewer       /usd/viewer/
 liveness     /livez
 readiness    /readyz
 port         8806
@@ -44,40 +42,127 @@ port         8806
 
 | Standard or protocol | Implemented profile |
 |---|---|
-| [Model Context Protocol](https://modelcontextprotocol.io/specification/) | Version `2026-07-28`, JSON-RPC 2.0 over Streamable HTTP, under the hosted MCP contract `https://veoveo.ai/contracts/hosted-mcp` that `veoveo-hub-sdk` a9abfd2 implements over rmcp 3.8.0. The server exposes one tool, resources and templates, completions of the documents template, typed structured content and one skill. It declares no prompts, Tasks or subscriptions. |
+| [Model Context Protocol](https://modelcontextprotocol.io/specification/) | Version `2026-07-28`, JSON-RPC 2.0 over Streamable HTTP, under the hosted MCP contract `https://veoveo.ai/contracts/hosted-mcp` that `veoveo-hub-sdk` 886cb6a implements over rmcp 3.8.0. The server exposes three tools, one of them a Task, one App, the documents and contract resources, typed structured content and one skill. |
+| [MCP Tasks extension](https://github.com/modelcontextprotocol/ext-tasks) | `render_stage` runs as a durable Task in core's Task runtime, through the SDK's adapter. |
+| [MCP Apps](https://github.com/modelcontextprotocol/ext-apps) `2026-01-26` | `ui://usd/scenes`, in the host's ordinary frame, through the bridge. |
 | [MCP Skills extension](https://github.com/modelcontextprotocol/ext-skills) `io.modelcontextprotocol/skills`, SEP-2640, and the [Agent Skills](https://agentskills.io/specification) format | The skills under `skills/`, embedded at build time and served at `skill://usd/{name}/{path}` through the SDK; see [Skills](#skills) |
-| [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/) | Tool inputs and results and resource contents, generated by Schemars from the contract's types. |
-| [URI Template RFC 6570](https://www.rfc-editor.org/rfc/rfc6570) | Discovery declares simple variables and a listing that continues through a `cursor` query parameter. |
+| [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/) | Tool inputs and results, generated by Schemars from the contract's types. |
 | [JWT access tokens RFC 9068](https://www.rfc-editor.org/rfc/rfc9068.html) | The Hub forwards each request with an access token that names the caller, the caller's tenant and the permissions it granted. |
-| [Veoveo server registration](https://github.com/VeoveoAI/veoveo-hub-sdk) | The server initially registers through RFC7591, resumes native RFC7592 credentials on restart, and declares its permissions in `ai.veoveo/authorization`. |
-| [PostgreSQL 18](https://www.postgresql.org/docs/18/) | Server 18.6 through sqlx 0.9.0, under the [installation database design](https://github.com/VeoveoAI/veoveo-core/blob/9a6b3ff95469ff19f9ccb513421a57ba6751aa9e/docs/DATABASE.md) of `veoveo-core`. The server owns the schema `usd`, applies its own migrations and runs every statement from a `.sql` file that sqlx checks. |
+| [Veoveo server registration](https://github.com/VeoveoAI/veoveo-hub-sdk) | The server initially registers through RFC7591, resumes native RFC7592 credentials on restart, and declares its permissions, public route and viewer in its registration. |
+| [OpenUSD](https://openusd.org/release/spec.html) | Read through `openusd` and drawn through `usd_bevy`. |
+| [WebGPU](https://www.w3.org/TR/webgpu/) | The viewer's only graphics API. WebGL2 is not compiled in. |
 
 ## Domain Contract
 
 The server answers these questions for a caller:
 
-- Which items does my tenant hold, in the order they were created?
-- What is the item at this address?
+- Which repositories can I read, and which scenes does one hold?
+- What does this stage hold: its layers, its time range, its cameras, its variants and payloads?
+- What does this stage look like at this time, from this camera, with these variants?
 
 | Surface | Name | Permission | Result |
 |---|---|---|---|
-| Tool | `create_item` | `usd.items.write` | `Product<CreatedItem>`, whose `resultUri` is the new item's address |
-| Resource | `usd://items{?limit,cursor}` | `usd.items.read` | `Page<Items>`: up to 100 items and the next page's cursor |
-| Resource | `usd://item/{item_id}` | `usd.items.read` | `ItemView` |
-| Resource | `usd://docs`, `usd://docs/{doc_id}`, `usd://contract` | `usd.items.read` | The embedded documents and the contract declaration |
-| Skill | `skill://usd/keep-items/SKILL.md` and its files | `usd.items.read` | The skill's manifest from `skills/get` and each file's text from `resources/read` |
+| Tool | `list_scenes` | `usd.stages.read` | `SceneListing`: without a `repository`, the repositories the caller can read; with one, its scenes on `branch`, `main` by default, each with the path that opens it |
+| Tool | `inspect_stage` | `usd.stages.read` | `StageReport` |
+| Task tool | `render_stage` | `usd.stages.render` | `Product<RenderedStage>`, whose `resultUri` is the PNG's `artifact://artifacts/{id}` |
+| App | `ui://usd/scenes` | `usd.stages.read` | The scene browser |
+| Public route | `/usd/viewer/` | None; it holds only the viewer's published files | The viewer, for `usd`, `usda`, `usdc` and `usdz` |
+| Resource | `usd://docs`, `usd://docs/{doc_id}`, `usd://contract` | `usd.stages.read` | The embedded documents and the contract declaration |
+| Skill | `skill://usd/view-stages/SKILL.md` | `usd.stages.read` | The skill's manifest from `skills/get` and each file's text from `resources/read` |
 
-An item is a UUIDv7 the server generates and a name of 1 to 128 characters. The
-caller's tenant comes from the forwarded identity, never from an argument. An item of
-another tenant reads as missing.
+The server has no tables of its own and holds no scene. What it knows of a stage it reads when asked. A render's outcome
+lives in its Task and its Artifact.
+
+### Reading A Stage
+
+`hub` calls the Hub's routes with `hub_bearer`, as the tool's caller or the Task's owner:
+`GET /lore/{profile}/repositories` and
+[`GET /lore/{profile}/repositories/{id}/files/{branch}/{path}`](https://github.com/VeoveoAI/veoveo-hub/blob/main/crates/veoveo-hub/DESIGN.md#files-from-lore).
+The Hub decides each call. A refusal reaches the agent with its status and problem detail, and the server keeps no copy of
+what it read.
+
+`stage::gather` starts from the root's bytes and composes them with `usd_bevy`'s `UsdSource::from_memory`, which names the
+dependencies the stage asks for and does not have. It fetches those, by their paths relative to the repository's top, and
+composes again until nothing it can fetch is missing. A dependency Lore does not hold stays listed as missing, and an
+`inspect_stage` still reports the rest. Inspecting needs only layers, so it fetches files of the USD extensions; rendering
+needs textures too, so it fetches everything. Composition runs on a blocking thread, since a stage is not `Send`.
+
+`inspect_stage` keeps it all in memory, with no checkout or disk. Lists in a report stop at `MAX_LISTED` entries, and
+`truncated` says so.
+
+### Rendering
+
+`render_stage` takes `repository`, `branch`, `path`, `time`, `camera` and `variants`. Its work is one durable step, which
+`RecoveryClass::Resume` runs again from the start if the process stops, with the same Artifact idempotency key:
+
+1. Gather everything the stage names, as the Task's owner.
+2. Write those files to a temporary folder, in their repository layout. The folder lasts as long as the step.
+3. Run `veoveo-mcp-usd render` from `current_exe` as a child process, which draws one frame. A cancelled Task kills it.
+4. Store the PNG with `ArtifactClient` bound to the Task, with the owner's data labels and metadata naming `repository`,
+   `branch`, `revision`, `path`, `address`, `time`, `camera` and `variants`.
+
+The Hub's files route answers each file's content address as its `ETag`, and `address` is the root's. `revision` is the
+branch's tip at the moment the root was read, from the Hub's `Lore-Revision` header. Because Artifact indexes images, renders
+can be found by meaning with `artifact__search_knowledge`; this server needs no knowledge contract of its own.
+
+The child runs apart from the server because Bevy owns its process's main loop, so `main` dispatches `render` before it
+builds the server's runtime:
+
+```sh
+veoveo-mcp-usd render STAGE FRAMES.txt [--variant PRIM SET SELECTION]...
+```
+
+It draws to a texture with no window, reads each frame back to a PNG, and exits with an error on a software adapter or a
+stage that shows no geometry. Each line of `FRAMES.txt` is one frame: `TIME OUTPUT.png` frames the whole stage,
+`TIME OUTPUT.png EYE_X EYE_Y EYE_Z FOCUS_X FOCUS_Y FOCUS_Z` looks from an eye at a focus, and `TIME OUTPUT.png @/PRIM/PATH`
+looks through a `UsdGeomCamera`, with its projection. A camera the stage does not hold fails the render.
+
+### The Scene Browser
+
+`ui://usd/scenes` is a small page in an ordinary App frame, under `assets/scenes.html`. It calls `list_scenes` through the
+bridge, lists the repositories and their scenes, and opens one with `ui/open-link` on
+`/view/lore/{repository}/{branch}/{path}`, which the host admits and the Hub opens on the content domain. It keeps no state
+and has no route of its own.
+
+### The Viewer
+
+`crates/usd-viewer` is `usd_bevy` in the browser, on WebGPU. The server serves its built files, which `openshell/run` makes
+under `target/viewer/`, from the public route `/usd/viewer/`, and declares it as the viewer of the four USD extensions. The
+Hub [reaches that route](https://github.com/VeoveoAI/veoveo-hub/blob/main/crates/veoveo-hub/DESIGN.md#viewers) at
+`/_veoveo/viewers/usd/` on the file's origin, and hands it the file's path in the query parameter `file`. The route's answers
+say `Cache-Control: no-cache`, so that the browser revalidates, and it answers the gzip copy of a file to a browser that takes
+it.
+
+The viewer asks only its own origin. It loads the stage from that origin by path, with dependencies by their relative
+paths, and it never sees a token. It lists the item's scenes from the folder listings the origin answers. Opening another
+scene reloads the page with a new `file`, because WASM memory never shrinks.
+
+Its panels are egui, drawn over the canvas. `bevy_egui`'s shader opens with `enable wgpu_binding_array`, a directive of wgpu's
+own compiler, which a browser refuses, so the viewer replaces it with a copy without its bindless parts, `src/egui.wgsl`.
+
+| Panel | What it does |
+|---|---|
+| Scenes | The item's scenes; choosing one opens it |
+| Prims | The stage's tree, read lazily; choosing a prim selects it and shows its type |
+| Variants | Each variant set on the stage's prims, with its options; choosing one sets `UsdInstanceOverrides`, and the live stage reconciles |
+| Payloads | Each prim with a payload, and whether it is loaded; a toggle loads or unloads it |
+| Time | A slider over the stage's time range, the time code, and play and pause through `UsdPlayback` |
+| Cameras | Each `UsdGeomCamera`, and the free orbit camera; choosing one looks through it, and dragging returns to free orbit |
+
+Drag orbits, scroll zooms, and neither reaches the stage while the pointer is over a panel. It reports to its parent page,
+and to the console, as `{"usdViewer":{"state":...}}` messages: `started`, `loading`, `ready`, `measured`, `seeked` (a new
+time, with how long it took to show) and `failed`.
+
+A hidden tab draws nothing and makes no progress, because the browser stops the animation frames the app runs on; see the
+[record](https://github.com/VeoveoAI/veoveo-docs/blob/main/records/2026-11-05-usd-server-and-viewer.md).
 
 ## Skills
 
 How an agent uses a server is in the server's skills, which a host loads when a task
 needs one, as the [MCP Skills extension](https://github.com/modelcontextprotocol/ext-skills)
 describes. The tools' and resources' descriptions say only what each does, and the
-server's `instructions` say what it is and name each skill's address. `keep-items` is
-the skill it carries from the template:
+server's `instructions` say what it is and name each skill's address. `view-stages` says how to find a scene, inspect it,
+render it and open it:
 
 - A skill is a directory `skills/{name}/` holding `SKILL.md`, whose YAML frontmatter
   gives the skill's `name`, equal to the directory's, and its `description`, which says
@@ -91,8 +176,8 @@ the skill it carries from the template:
 - The server answers `skills/list` and `skills/get` with each skill's manifest, every
   file's address `skill://usd/{name}/{path}`, its SHA-256 and its size, and
   `resources/read` with each file's text. The files are resources under the server's
-  document policy, `usd.items.read`.
-- Skill text names each tool as callers see it through the Hub, `usd__create_item`,
+  document policy, `usd.stages.read`.
+- Skill text names each tool as callers see it through the Hub, `usd__render_stage`,
   and each resource by the address callers read.
 
 ## Architecture
@@ -101,8 +186,8 @@ the skill it carries from the template:
 
 | Feature | Holds | Depends on |
 |---|---|---|
-| `contract` | `ItemId`, `ItemName`, `Items`, `UsdResource`, `UsdPermission`, the tool request and the results | `veoveo-types`, the SDK's `contract` feature, Serde and Schemars |
-| `server` (default) | The hosted server, the item store, the embedded skills and the binary | The SDK's `server` feature, core's store and skills, sqlx and rmcp, and `render` |
+| `contract` | `RepositoryId`, `BranchName`, `StagePath`, `UsdResource`, `UsdPermission`, the tool requests and the results | `veoveo-types`, the SDK's `contract` feature, Serde and Schemars |
+| `server` (default) | The hosted server, the Hub calls, the stage reads, the render Task, the viewer route, the App, the embedded skills and the binary | The SDK's `server` feature, core's Task runtime and skills, Artifact's `client` feature, rmcp, and `render` |
 | `render` | The `render` subcommand | Bevy and `usd_bevy` |
 
 ### Modules
@@ -110,9 +195,12 @@ the skill it carries from the template:
 | Module | Responsibility |
 |---|---|
 | `contract` | The public types a consumer compiles against |
-| `mcp` | The typed ready routes, resource readers, checked setup and registration declaration |
-| `store` | The `usd` schema's statements and the keyset listing |
-| `server` | Configuration, registration with the Hub, the database connection, the process instance and serving |
+| `hub` | The Hub's repository and files routes, as a caller or a Task's owner |
+| `stage` | Gathering a stage's files, and the report |
+| `work` | The render Task's work |
+| `mcp` | The typed ready routes, the App, the Task service, checked setup and registration declaration |
+| `viewer` | The public route that serves the viewer's files |
+| `server` | Configuration, registration with the Hub, the Task runtime, the process instance and serving |
 | `render` | The `render` subcommand |
 
 ### Startup
@@ -120,9 +208,9 @@ the skill it carries from the template:
 The server builds its registration declaration from the public base URL and checks the
 MCP setup before it contacts anything. It registers with the Hub, which issues a
 database login for the `usd` schema and the trust for forwarded tokens. With that
-login it connects, starts a process instance, applies its migrations and serves. The
+login it connects the Task runtime, which holds the process instance, and serves. The
 registration lasts while the instance holds its lock. Serving ends on SIGTERM, on
-Ctrl-C or when the instance loses its lock. Native saved registration remains for
+Ctrl-C or when the worker can no longer claim Tasks. Native saved registration remains for
 resume; explicit retirement deletes it, and the Hub's existing orphan grace applies.
 
 Required `VEOVEO_DEPLOYMENT_ID` (`--deployment-id`) is a trusted-allocated UUIDv7
@@ -136,6 +224,9 @@ ClientInformation against exact metadata/key/Hub authority, preserving its origi
 private database grant only for that same verified registration. A missing/expired
 registration requires fresh trusted scoped admission, with no global-bootstrap fallback.
 
+`VEOVEO_VIEWER_DIRECTORY` names the viewer's built files and `VEOVEO_APP_HTML` the App's document. The App's document is read
+once at startup.
+
 ## Factory
 
 A branch of a repository made from the template is served from its own factory sandbox
@@ -146,7 +237,7 @@ build and run it. The repository owns these paths, versioned with each branch:
 | Path | Holds |
 |---|---|
 | `openshell/image/` | The environment image: a `Dockerfile` and the files it copies, with the toolchain that builds the branch and nothing else. It runs as UID 10001, and its caches live under `/sandbox`, the sandbox's persistent disk |
-| `openshell/run` | Builds the branch in its checkout, then `exec`s the server. It sets what is server-specific, such as the key directory under `/sandbox/state` |
+| `openshell/run` | Builds the viewer and the server in the branch's checkout, then `exec`s the server. It sets what is server-specific, such as the key directory under `/sandbox/state` and where the viewer's files are |
 | `openshell/policy.yaml` | Optional network rules, in OpenShell's own policy format, for anything the installation's base policy does not admit |
 | `openshell/providers.yaml` | Optional: the installation provider profiles the branch requests by name under `providers`, such as `vv-factory-model`. The Hub attaches only those the control plane grants to the repository, and the instance's status names each one it did not attach |
 
@@ -161,44 +252,27 @@ the registration secret in the environment, and the server resumes its saved
 registration on every later start. A push that changes `openshell/image/`,
 `openshell/policy.yaml` or `openshell/providers.yaml`, or the first push after the installation changed its factory
 template, gives the branch a new sandbox with an empty disk; any other push restarts
-it. The root `Dockerfile` stays the release and check build.
+it. The root `Dockerfile` stays the check build.
 
 This repository's image also opts in to the GPU, with `ENV NVIDIA_VISIBLE_DEVICES=all` and
-`ENV NVIDIA_DRIVER_CAPABILITIES=all` and the libraries the driver's Vulkan needs. Under the nvidia runtime that gives it the
-device, with no Kubernetes claim.
+`ENV NVIDIA_DRIVER_CAPABILITIES=all` and the libraries the driver's Vulkan needs. The factory template names the `nvidia`
+runtime class, which exposes no device by itself, so under it those two variables give this sandbox the device, with no
+Kubernetes claim. A repository whose image does not ask for it has no GPU.
 
 ## Persistence
 
-| Table | Key | Retention |
-|---|---|---|
-| `usd.item` | `(tenant, item_id)` | For the life of the tenant. The server deletes no item. |
-
-Each statement binds the tenant. The listing has a first-page statement and an
-after-cursor statement, both bounded by the page size plus one row of lookahead, and a
-cursor is admitted only for the listing, tenant, filters and limit that issued it.
-`Pager<Items>` admits the token, supplies the SQL seek and fetch bound, checks the
-unique UUIDv7 order and owns lookahead/continuation construction. Responses use
-`{items, limit, nextCursor}`; the terminal token is null. Tokens are opaque to clients
-and bounded to 4096 bytes. This is a live keyset: unchanged data is visited once in
-order, while concurrent insertion after the seek may appear in the remaining walk.
-Every request uses current tenant and route admission; tokens grant no access.
-
-`ReadCollection<ReadItems>` owns resource URI limit/cursor encoding and parsing; its
-owner template is `usd://items`, and the SDK adds the optional paging query
-expression for discovery and authorization. The route builder requires a typed
-reader, policy and cache selection. `create_item` is declared by the contract-side
-`tool` attribute, and both resource readers use thin attributes over ordinary public
-traits. The product constructor owns the canonical address; `CreatedItem` is only
-`{format, item}` metadata. The SDK serializes `{resultUri, metadata}`, adds its link
-and mirrors the complete structured value as JSON text.
+The server has no tables. Its schema `usd` exists because the Hub makes one for each registration, and holds nothing. A
+render's Task lives in core's Task runtime, for `RENDER_RETENTION` after it ends, and its PNG in Artifact under Artifact's own
+retention.
 
 ## Qualification
 
 | Test | Holds |
 |---|---|
-| `src/contract` unit tests | Identity and name admission and typed address round trips |
+| `src/contract` unit tests | Identity, branch and path admission and typed address round trips |
 | `src/mcp` unit tests | Ready route and embedded document construction, and instructions that name every skill |
-| `tests/items.rs` | Paging in key order and tenant-bound cursors against a migrated database |
-| `tests/mcp.rs` | Discovery, permission refusals, `create_item`, the item read and the listing through the SDK's test Hub, and a skills manifest that names exactly the files under `skills/keep-items/`, each with the size and SHA-256 of the text a read answers |
-| `tests/database_conformance.rs` | Core's server schema rules over every statement and the schema |
-| `tests/sql_confinement.rs` | The server's SQL names only the `usd` schema |
+| `src/stage` unit tests | A stage's closure gathered through dependency rounds, with missing files listed, and the report of a fixture stage |
+| `src/hub` unit tests | Each path segment encoded once, and a folder listing decoded |
+| `src/render` unit tests | The frames file and its arguments |
+| `tests/mcp.rs` | Discovery, permission refusals, the App's document and links, the viewer's route and registration, and a skills manifest that names exactly the files under `skills/view-stages/`, each with the size and SHA-256 of the text a read answers |
+| `crates/usd_bevy` | The copied tests, with `UPSTREAM.md`'s changes |

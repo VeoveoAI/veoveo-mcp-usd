@@ -12,43 +12,51 @@ workspace = true
 
 [features]
 default = ["server"]
-# The server's public types: item identities and names, resource addresses, tool
-# requests and results and the permission vocabulary. No database or runtime dependency.
+# The server's public types: checked names, resource addresses, tool requests and results
+# and the permission vocabulary. No runtime dependency.
 contract = [
     "dep:schemars",
     "dep:serde",
     "dep:thiserror",
-    "dep:uuid",
     "dep:veoveo-hub-sdk",
     "dep:veoveo-types",
 ]
-# The hosted server: MCP through the SDK, persistence in the `usd` schema and the
-# binary.
+# The hosted server: MCP through the SDK, stage reads through the Hub, the render Task and
+# the binary.
 server = [
     "contract",
     "render",
     "veoveo-hub-sdk/server",
     "dep:anyhow",
+    "dep:axum",
+    "dep:bytes",
     "dep:clap",
     "dep:dotenvy",
+    "dep:futures",
     "dep:reqwest",
     "dep:rmcp",
     "dep:rustls",
     "dep:secrecy",
     "dep:serde_json",
-    "dep:sqlx",
+    "dep:tempfile",
     "dep:tokio",
     "tokio/rt-multi-thread",
     "tokio/macros",
     "tokio/signal",
+    "tokio/process",
+    "tokio/fs",
+    "dep:tokio-util",
+    "dep:tower-http",
     "dep:tracing",
     "dep:url",
+    "dep:veoveo-mcp-artifact",
+    "veoveo-mcp-artifact/client",
     "dep:veoveo-skills",
-    "dep:veoveo-store",
+    "dep:veoveo-task",
 ]
 
 # Rendering a USD stage to images on the GPU: the binary's `render` subcommand.
-render = ["dep:anyhow", "dep:bevy", "dep:usd_bevy"]
+render = ["dep:anyhow", "dep:bevy", "dep:openusd", "dep:usd_bevy"]
 
 [build-dependencies]
 # Embeds the skills under skills/ at build time.
@@ -58,13 +66,21 @@ veoveo-skills = { workspace = true, features = ["build"] }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
 veoveo-hub-sdk = { workspace = true, features = ["contract"], optional = true }
 veoveo-types = { workspace = true, optional = true }
 
 anyhow = { workspace = true, optional = true }
 bevy = { workspace = true, optional = true, features = ["multi_threaded", "bevy_window"] }
+openusd = { git = "https://github.com/mxpv/openusd", rev = "d10fa4c2838e1e18a5c4fb4aa47534f94fde8995", optional = true }
 usd_bevy = { path = "../usd_bevy", optional = true }
+axum = { workspace = true, features = ["http1", "tokio"], optional = true }
+bytes = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tower-http = { workspace = true, optional = true }
+veoveo-mcp-artifact = { workspace = true, optional = true }
+veoveo-task = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 dotenvy = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["rustls-no-provider"], optional = true }
@@ -72,18 +88,16 @@ rmcp = { workspace = true, features = ["server", "macros", "schemars", "transpor
 rustls = { workspace = true, optional = true }
 secrecy = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["sync", "time", "net"] }
 tracing = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 veoveo-skills = { workspace = true, optional = true }
-veoveo-store = { workspace = true, optional = true }
 
 [dev-dependencies]
+rmcp.workspace = true
 tempfile.workspace = true
+tower.workspace = true
 veoveo-hub-sdk = { workspace = true, features = ["server", "testing"] }
-# `database-conformance` holds the crate's queries and schema to core's database rules.
-veoveo-fixtures = { workspace = true, features = ["store", "database-conformance"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }
 
@@ -92,17 +106,5 @@ name = "veoveo-mcp-usd"
 required-features = ["server"]
 
 [[test]]
-name = "database_conformance"
-required-features = ["server"]
-
-[[test]]
-name = "items"
-required-features = ["server"]
-
-[[test]]
 name = "mcp"
-required-features = ["server"]
-
-[[test]]
-name = "sql_confinement"
 required-features = ["server"]

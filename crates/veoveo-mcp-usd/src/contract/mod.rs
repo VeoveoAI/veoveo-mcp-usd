@@ -1,14 +1,18 @@
 //! The server's public types. Consumers select `default-features = false,
-//! features = ["contract"]`, which builds without a database or runtime dependency.
+//! features = ["contract"]`, which builds without a runtime dependency.
 
 mod calls;
-pub use calls::{Items, ReadItem, ReadItems, UsdProvider};
+pub use calls::UsdProvider;
 mod ids;
-mod items;
 mod permissions;
 mod resource;
+mod stages;
 
-pub use ids::{ItemId, ItemName, MAX_ITEM_NAME_CHARS, UsdIdError};
-pub use items::{CreateItemRequest, CreatedItem, ITEM_FORMAT, ItemView};
+pub use ids::{BranchName, PrimPath, RepositoryId, StagePath, UsdIdError};
 pub use permissions::{UsdPermission, UsdScope};
 pub use resource::{UsdDocument, UsdResource, UsdResourceError};
+pub use stages::{
+    DEFAULT_BRANCH, InspectStageRequest, ListScenesRequest, MAX_LISTED, RENDERED_FORMAT,
+    RenderCamera, RenderStageRequest, RenderedStage, RepositorySummary, STAGE_FORMAT, Scene,
+    SceneListing, StageReport, TypeCount, VariantChoice, VariantSetReport,
+};

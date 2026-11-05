@@ -4,18 +4,30 @@ use anyhow::{Context, Result};
 use veoveo_hub_sdk::registration::{
     ClientMetadata, RegistrationDeclaration,
     client::{KeyDirectory, Registration, RegistrationClient},
+    statement::ServerKeyPair,
 };
 
 use super::config::Args;
 use crate::mcp::AUTHORIZATION;
 
-/// Resume or initially register the server. Returns the lifecycle client, the
-/// registration, and the HTTP client that reached the Hub, which also fetches the
-/// Hub's token keys when a forwarded token names a key the registration lacks.
+/// What registering leaves for serving.
+pub(super) struct Registered {
+    /// The lifecycle client.
+    pub client: RegistrationClient,
+    pub registration: Registration,
+    /// What calls through the Hub are signed with.
+    pub metadata: ClientMetadata,
+    pub key: ServerKeyPair,
+    /// The HTTP client that reached the Hub, which also fetches the Hub's token keys when a
+    /// forwarded token names a key the registration lacks, and calls the Hub's routes.
+    pub http: reqwest::Client,
+}
+
+/// Resume or initially register the server.
 pub(super) async fn register(
     args: &Args,
     declaration: RegistrationDeclaration,
-) -> Result<(RegistrationClient, Registration, reqwest::Client)> {
+) -> Result<Registered> {
     let keys = KeyDirectory::new(&args.key_directory);
     let metadata = prepare(args, declaration)?;
     let key = keys
@@ -39,14 +51,23 @@ pub(super) async fn register(
             .clone()
             .context("serving requires initial registration admission")?,
         key,
-        metadata,
+        metadata.clone(),
     )?;
     let registration = client
         .resume_or_register(&keys)
         .await
         .context("registering the server with the Hub")?;
     tracing::info!(client_id = %registration.client_id(), "registered with the Hub");
-    Ok((client, registration, http))
+    let key = keys
+        .load_or_generate()
+        .context("loading the server's registration key")?;
+    Ok(Registered {
+        client,
+        registration,
+        metadata,
+        key,
+        http,
+    })
 }
 
 /// Identical metadata construction for offline admission and actual serving.

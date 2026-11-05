@@ -2,6 +2,10 @@
 //! example, and builds for `wasm32-unknown-unknown` alone.
 
 #[cfg(target_arch = "wasm32")]
+mod panels;
+#[cfg(target_arch = "wasm32")]
+mod scenes;
+#[cfg(target_arch = "wasm32")]
 mod viewer;
 
 #[cfg(target_arch = "wasm32")]

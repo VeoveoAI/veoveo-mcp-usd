@@ -53,7 +53,6 @@ fn server_config() -> ServerConfig {
     let mut capabilities = ServerCapabilities::builder()
         .enable_tools()
         .enable_resources()
-        .enable_completions()
         .build();
     if let Some(registration) = super::declarations::REGISTRATION.get() {
         veoveo_hub_sdk::registration::mcp::advertise(
@@ -71,8 +70,9 @@ fn server_config() -> ServerConfig {
 
 /// What the server is and which skill says how to use it. A server's instructions say no
 /// more: its guidance is in its skills.
-const INSTRUCTIONS: &str = "Keeps a list of named items for your tenant. Its skill says \
-     how: skill://usd/keep-items/SKILL.md.";
+const INSTRUCTIONS: &str = "Shows USD stages that live in Lore repositories: lists scenes, reports \
+     what a stage holds, renders one to a PNG in Artifact, and opens one in the viewer. Its skill \
+     says how: skill://usd/view-stages/SKILL.md.";
 
 #[cfg(test)]
 mod tests {
@@ -89,6 +89,6 @@ mod tests {
     fn the_setup_round_trips_every_resource_and_template() {
         let setup = &*super::SERVER_SETUP;
         assert_eq!(setup.resources().len(), 5);
-        assert_eq!(setup.resource_templates().len(), 3);
+        assert_eq!(setup.resource_templates().len(), 1);
     }
 }

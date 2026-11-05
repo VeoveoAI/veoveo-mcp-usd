@@ -1,9 +1,15 @@
 #!/bin/sh
-# Builds this branch, then replaces itself with the server. The installation runs it
-# from the branch's checkout after every fetch and supplies the server's deployment,
-# Hub and registration settings in the environment.
+# Builds the viewer and the server in the branch's checkout, then runs the server.
 set -e
+cargo build --locked --profile wasm-release --target wasm32-unknown-unknown -p usd-viewer
+wasm-bindgen --target web --no-typescript --remove-name-section --remove-producers-section \
+    --out-dir target/viewer --out-name usd_viewer \
+    target/wasm32-unknown-unknown/wasm-release/usd-viewer.wasm
+cp crates/usd-viewer/web/index.html target/viewer/
+gzip --best --keep --force target/viewer/usd_viewer_bg.wasm target/viewer/usd_viewer.js
 cargo build --locked --release --bin veoveo-mcp-usd
 export VEOVEO_KEY_DIRECTORY=/sandbox/state/keys
+export VEOVEO_VIEWER_DIRECTORY="$PWD/target/viewer"
+export VEOVEO_APP_HTML="$PWD/crates/veoveo-mcp-usd/assets/scenes.html"
 mkdir -p "$VEOVEO_KEY_DIRECTORY"
 exec target/release/veoveo-mcp-usd

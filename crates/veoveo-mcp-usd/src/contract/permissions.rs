@@ -18,16 +18,16 @@ pub enum UsdScope {
 /// ```compile_fail
 /// use veoveo_mcp_usd::contract::UsdPermission;
 /// fn requires(_: UsdPermission) {}
-/// requires("usd.items.read");
+/// requires("usd.stages.read");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Vocabulary)]
 pub enum UsdPermission {
-    /// Read your tenant's items and the server's documents.
-    #[vocabulary(rename = "usd.items.read")]
-    ItemsRead,
-    /// Create items in your tenant.
-    #[vocabulary(rename = "usd.items.write")]
-    ItemsWrite,
+    /// List scenes and inspect stages you can read, and read the server's documents.
+    #[vocabulary(rename = "usd.stages.read")]
+    StagesRead,
+    /// Render stages you can read, into your Artifact.
+    #[vocabulary(rename = "usd.stages.render")]
+    StagesRender,
 }
 
 impl UsdPermission {
@@ -39,13 +39,13 @@ impl UsdPermission {
 
 impl PermissionDefinition for UsdPermission {
     fn resource(self) -> &'static str {
-        "usd.item"
+        "usd.stage"
     }
 
     fn access(self) -> Access {
         match self {
-            Self::ItemsRead => Access::Read,
-            Self::ItemsWrite => Access::Write,
+            Self::StagesRead => Access::Read,
+            Self::StagesRender => Access::Write,
         }
     }
 

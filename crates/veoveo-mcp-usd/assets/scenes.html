@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>USD scenes</title>
+<style>
+:root {
+  --bg: var(--color-background-primary, #ffffff);
+  --soft: var(--color-background-secondary, #f4f5f7);
+  --fg: var(--color-text-primary, #16181d);
+  --muted: var(--color-text-secondary, #5b616e);
+  --line: var(--color-border-primary, #dfe2e7);
+  --accent: var(--color-text-info, #2557d6);
+  --danger: var(--color-text-danger, #b42318);
+  --radius: var(--border-radius-md, 8px);
+  --sans: var(--font-sans, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+}
+:root[data-theme="dark"] {
+  --bg: var(--color-background-primary, #14161a);
+  --soft: var(--color-background-secondary, #1d2026);
+  --fg: var(--color-text-primary, #e8eaee);
+  --muted: var(--color-text-secondary, #9aa1ad);
+  --line: var(--color-border-primary, #2c3038);
+  --accent: var(--color-text-info, #7aa2ff);
+  --danger: var(--color-text-danger, #ff8a80);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--sans); }
+main { padding: 12px; display: grid; gap: 12px; }
+h1 { font-size: 15px; font-weight: 600; margin: 0; }
+h2 { font-size: 13px; font-weight: 600; margin: 0 0 6px; color: var(--muted); }
+ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+button { width: 100%; display: flex; justify-content: space-between; gap: 12px; text-align: left; font: inherit; color: var(--fg);
+  background: var(--soft); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; cursor: pointer; }
+button:hover, button:focus-visible { border-color: var(--accent); outline: none; }
+button[aria-pressed="true"] { border-color: var(--accent); }
+.size { color: var(--muted); white-space: nowrap; }
+.note { color: var(--muted); margin: 0; }
+.error { color: var(--danger); margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>USD scenes</h1>
+  <section><h2>Repositories</h2><ul id="repositories"></ul></section>
+  <section id="scenes-section" hidden><h2 id="scenes-title">Scenes</h2><ul id="scenes"></ul></section>
+  <p class="note" id="note">Loading…</p>
+  <p class="error" id="error" hidden></p>
+</main>
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const pending = new Map();
+  let nextId = 1;
+
+  const post = (message) => window.parent.postMessage(message, "*");
+  const notify = (method, params) => post({ jsonrpc: "2.0", method, params });
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    pending.set(id, { resolve, reject });
+    post({ jsonrpc: "2.0", id, method, params });
+  });
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window.parent) return;
+    const message = event.data;
+    if (!message || typeof message !== "object" || message.jsonrpc !== "2.0") return;
+    if (typeof message.method === "string") {
+      if (message.id !== undefined && message.id !== null) {
+        post(message.method === "ping" || message.method === "ui/resource-teardown"
+          ? { jsonrpc: "2.0", id: message.id, result: {} }
+          : { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `not handled: ${message.method}` } });
+      } else if (message.method === "ui/notifications/host-context-changed") {
+        applyTheme(message.params);
+      }
+      return;
+    }
+    const call = pending.get(message.id);
+    if (!call) return;
+    pending.delete(message.id);
+    if (message.error) call.reject(new Error(message.error.message || "the host refused"));
+    else call.resolve(message.result);
+  });
+
+  const applyTheme = (context) => {
+    if (context && context.theme) document.documentElement.dataset.theme = context.theme;
+  };
+
+  const showError = (error) => {
+    $("error").textContent = String(error.message || error);
+    $("error").hidden = false;
+    $("note").hidden = true;
+  };
+
+  /** The structured answer of list_scenes, or its error text. */
+  const listScenes = async (args) => {
+    const reply = await request("tools/call", { name: "list_scenes", arguments: args });
+    if (reply.isError) {
+      throw new Error((reply.content || []).map((part) => part.text || "").join(" ") || "list_scenes failed");
+    }
+    return reply.structuredContent;
+  };
+
+  const size = (bytes) => {
+    if (typeof bytes !== "number") return "";
+    return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  };
+
+  const item = (label, detail, onClick) => {
+    const li = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    const name = document.createElement("span");
+    name.textContent = label;
+    const extra = document.createElement("span");
+    extra.className = "size";
+    extra.textContent = detail;
+    button.append(name, extra);
+    button.addEventListener("click", () => onClick(button));
+    li.append(button);
+    return li;
+  };
+
+  /** The Hub's page for a file; each segment is encoded once. */
+  const viewUrl = (repository, branch, path) => {
+    const parts = ["view", "lore", repository, branch, ...path.split("/")];
+    return `/${parts.map(encodeURIComponent).join("/")}`;
+  };
+
+  const open = async (repository, branch, scene) => {
+    try {
+      await request("ui/open-link", { url: viewUrl(repository, branch, scene.path) });
+    } catch (error) {
+      showError(error);
+    }
+  };
+
+  const select = async (repository, button) => {
+    document.querySelectorAll("#repositories button").forEach((other) => other.setAttribute("aria-pressed", "false"));
+    button.setAttribute("aria-pressed", "true");
+    $("scenes").replaceChildren();
+    $("scenes-section").hidden = false;
+    $("scenes-title").textContent = `Scenes in ${repository.name}`;
+    $("note").hidden = false;
+    $("note").textContent = "Loading…";
+    $("error").hidden = true;
+    try {
+      const listing = await listScenes({ repository: repository.id });
+      const scenes = listing.scenes || [];
+      $("scenes").replaceChildren(...scenes.map((scene) =>
+        item(scene.name, size(scene.size), () => open(listing.repository, listing.branch, scene))));
+      $("note").textContent = scenes.length ? "" : "This repository holds no scenes on main.";
+      $("note").hidden = scenes.length > 0;
+    } catch (error) {
+      showError(error);
+    }
+  };
+
+  const start = async () => {
+    try {
+      const initialized = await request("ui/initialize", {
+        protocolVersion: "2026-01-26",
+        appInfo: { name: "usd-scenes", version: "0.1.0" },
+        appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
+      });
+      applyTheme(initialized && initialized.hostContext);
+      notify("ui/notifications/initialized", {});
+      const listing = await listScenes({});
+      const repositories = listing.repositories || [];
+      $("repositories").replaceChildren(...repositories.map((repository) =>
+        item(repository.name, "", (button) => select(repository, button))));
+      $("note").textContent = repositories.length ? "Choose a repository." : "You can read no repositories.";
+    } catch (error) {
+      showError(error);
+    }
+  };
+
+  start();
+})();
+</script>
+</body>
+</html>

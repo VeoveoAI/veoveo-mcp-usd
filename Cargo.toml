@@ -13,13 +13,14 @@ publish = false
 [workspace.dependencies]
 tempfile = "=3.27.0"
 # veoveo-core, pinned to one revision for every core crate.
-veoveo-fixtures = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "05b6c47540680e085cc5356ed4ba8742ecc78bff" }
-veoveo-skills = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "05b6c47540680e085cc5356ed4ba8742ecc78bff" }
-veoveo-store = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "05b6c47540680e085cc5356ed4ba8742ecc78bff" }
-veoveo-types = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "05b6c47540680e085cc5356ed4ba8742ecc78bff" }
+veoveo-skills = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "a8dafe90206d1cadbb1d2de26304fe061a542ffd" }
+veoveo-task = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "a8dafe90206d1cadbb1d2de26304fe061a542ffd" }
+veoveo-types = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "a8dafe90206d1cadbb1d2de26304fe061a542ffd" }
 # The Rust SDK for Veoveo MCP servers: the contract feature for declarations, the server
 # feature for hosting, registration and the forwarded identity.
-veoveo-hub-sdk = { git = "https://github.com/VeoveoAI/veoveo-hub-sdk", rev = "a9abfd20721bdb5588cfa632ec7b975f4036fec7", default-features = false }
+veoveo-hub-sdk = { git = "https://github.com/VeoveoAI/veoveo-hub-sdk", rev = "886cb6ab8e32ad412caaf537cf4ba6b92e8e8409", default-features = false }
+# Artifact's client, which stores a render's PNG. It pins this SDK revision, so the two move together.
+veoveo-mcp-artifact = { git = "https://github.com/VeoveoAI/veoveo-mcp-artifact", rev = "ad23b0511068969c94513ad8ad2b8944c8904bb2", default-features = false }
 
 # Rendering, without a window on the server and in a canvas in the viewer.
 bevy = { version = "=0.20.1", default-features = false, features = [
@@ -41,6 +42,12 @@ bevy = { version = "=0.20.1", default-features = false, features = [
     "reflect_auto_register",
 ] }
 anyhow = "=1.0.104"
+axum = { version = "0.8.9", default-features = false }
+bytes = "1.12.1"
+futures = "0.3.34"
+tokio-util = "0.7.20"
+tower = "0.5.3"
+tower-http = { version = "0.7.0", features = ["fs", "set-header"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dotenvy = "0.15.7"
 # The SDK's HTTP client release; registration and the tests share it.
@@ -55,13 +62,8 @@ url = "=2.5.8"
 schemars = { version = "1.2.2", features = ["uuid1"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
-# PostgreSQL 18 through the same sqlx release and features as veoveo-core. `sqlx-toml`
-# reads the crate's migration table from its `sqlx.toml`.
-sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring-native-roots", "uuid", "chrono", "json", "migrate", "macros", "sqlx-toml"] }
 thiserror = "=2.0.21"
 tokio = "1.53.1"
-# The exact release veoveo-types pins.
-uuid = { version = "=1.25.0", default-features = false, features = ["serde", "std", "v7"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

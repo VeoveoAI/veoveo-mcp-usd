@@ -4,11 +4,12 @@
 //! `crates/usd_bevy/LICENSE`.
 //!
 //! ```sh
-//! veoveo-mcp-usd render STAGE FRAMES.txt
+//! veoveo-mcp-usd render STAGE FRAMES.txt [--variant PRIM SET SELECTION]...
 //! ```
 //!
 //! Each line of `FRAMES.txt` is one frame: `TIME OUTPUT.png`, which frames the whole stage,
-//! or `TIME OUTPUT.png EYE_X EYE_Y EYE_Z FOCUS_X FOCUS_Y FOCUS_Z`.
+//! `TIME OUTPUT.png EYE_X EYE_Y EYE_Z FOCUS_X FOCUS_Y FOCUS_Z`, or `TIME OUTPUT.png @/PRIM/PATH`,
+//! which looks through one of the stage's cameras. A `TIME` of `start` is the stage's start.
 
 use std::{
     path::{Path, PathBuf},
@@ -33,9 +34,10 @@ use bevy::{
 use usd_bevy::{
     DisplayPurposes, UsdAssetPlugin, UsdPlugin, UsdProjectionBudget, UsdScene, UsdSceneRoot,
     UsdSceneState,
-    instance::UsdInstanceTime,
+    instance::{UsdInstanceOverrides, UsdInstanceTime, UsdInstances},
     mesh::bounds::StageBounds,
     route::{
+        camera::UsdCamera,
         dome_environment::UsdDomeEnvironmentPlugin,
         gpu_instancing::{UsdGpuInstancing, UsdGpuInstancingPlugin},
         gpu_skin::UsdGpuSkinningPlugin,
@@ -53,13 +55,24 @@ const VIEW: Vec3 = Vec3::new(0.7, 0.45, 1.0);
 /// Frames a ready stage may show nothing before the render gives up on it.
 const EMPTY: u32 = 120;
 
+/// Where a frame looks from.
+#[derive(Debug, PartialEq)]
+enum FrameCamera {
+    /// The whole stage.
+    Stage,
+    /// From an eye at a focus.
+    Look(Vec3, Vec3),
+    /// Through a camera of the stage.
+    Prim(String),
+}
+
 /// One frame to render.
 #[derive(Debug, PartialEq)]
 struct Frame {
-    time: f64,
+    /// The time code; the stage's start when none is named.
+    time: Option<f64>,
     output: PathBuf,
-    /// The camera's eye and focus. Without one, the frame shows the whole stage.
-    camera: Option<(Vec3, Vec3)>,
+    camera: FrameCamera,
 }
 
 /// The frames, and how far through them the render is.
@@ -78,9 +91,12 @@ struct Recorder {
 #[derive(Resource)]
 struct Target(Handle<Image>);
 
-/// The stage to load, by its name in its directory.
+/// The stage to load, by its name in its directory, and the variants to select.
 #[derive(Resource)]
-struct Stage(String);
+struct Stage {
+    name: String,
+    variants: Vec<(String, String, String)>,
+}
 
 /// The loaded stage's center and largest extent, in world space.
 #[derive(Resource, Clone, Copy)]
@@ -100,21 +116,28 @@ fn parse(text: &str) -> Result<Vec<Frame>> {
                     .map_err(|error| anyhow!("bad number {word} in: {line}: {error}"))
             };
             let (time, output, camera) = match words[..] {
-                [time, output] => (time, output, None),
+                [time, output] => (time, output, FrameCamera::Stage),
+                [time, output, prim] if prim.starts_with('@') => {
+                    (time, output, FrameCamera::Prim(prim[1..].to_owned()))
+                }
                 [time, output, ex, ey, ez, fx, fy, fz] => (
                     time,
                     output,
-                    Some((
+                    FrameCamera::Look(
                         Vec3::new(number(ex)?, number(ey)?, number(ez)?),
                         Vec3::new(number(fx)?, number(fy)?, number(fz)?),
-                    )),
+                    ),
                 ),
-                _ => bail!("expected TIME OUTPUT and an optional eye and focus: {line}"),
+                _ => bail!("expected TIME OUTPUT and an optional eye and focus or @camera: {line}"),
             };
             Ok(Frame {
-                time: time
-                    .parse()
-                    .map_err(|error| anyhow!("bad time {time} in: {line}: {error}"))?,
+                time: match time {
+                    "start" => None,
+                    time => Some(
+                        time.parse()
+                            .map_err(|error| anyhow!("bad time {time} in: {line}: {error}"))?,
+                    ),
+                },
                 output: PathBuf::from(output),
                 camera,
             })
@@ -122,11 +145,24 @@ fn parse(text: &str) -> Result<Vec<Frame>> {
         .collect()
 }
 
+/// The `--variant PRIM SET SELECTION` arguments.
+fn parse_variants(args: &[String]) -> Result<Vec<(String, String, String)>> {
+    args.chunks(4)
+        .map(|chunk| match chunk {
+            [flag, prim, set, selection] if flag == "--variant" => {
+                Ok((prim.clone(), set.clone(), selection.clone()))
+            }
+            _ => bail!("expected --variant PRIM SET SELECTION"),
+        })
+        .collect()
+}
+
 /// Renders `STAGE FRAMES.txt`, the subcommand's arguments.
 pub fn run(args: &[String]) -> Result<()> {
-    let [stage, list] = args else {
-        bail!("usage: render STAGE FRAMES.txt");
+    let [stage, list, variants @ ..] = args else {
+        bail!("usage: render STAGE FRAMES.txt [--variant PRIM SET SELECTION]...");
     };
+    let variants = parse_variants(variants)?;
     let text = std::fs::read_to_string(list).map_err(|error| anyhow!("reading {list}: {error}"))?;
     let frames = parse(&text)?;
     if frames.is_empty() {
@@ -169,7 +205,10 @@ pub fn run(args: &[String]) -> Result<()> {
         proxy: false,
         guide: false,
     })
-    .insert_resource(Stage(name.to_string_lossy().into_owned()))
+    .insert_resource(Stage {
+        name: name.to_string_lossy().into_owned(),
+        variants,
+    })
     .insert_resource(Recorder {
         frames,
         next: 0,
@@ -228,9 +267,24 @@ fn setup(
         Transform::from_translation(Vec3::new(0.5, 1.0, 0.6)).looking_at(Vec3::ZERO, Vec3::Y),
     ));
     commands.insert_resource(Target(target));
-    let scene: Handle<UsdScene> = server.load(stage.0.clone());
-    commands.spawn((UsdSceneRoot(scene), UsdInstanceTime::default()));
+    let scene: Handle<UsdScene> = server.load(stage.name.clone());
+    commands.spawn((
+        UsdSceneRoot(scene),
+        UsdInstanceTime::default(),
+        UsdInstanceOverrides {
+            variants: stage.variants.clone(),
+            attributes: vec![],
+        },
+    ));
 }
+
+/// The stage's cameras, apart from the camera that draws.
+type StageCameras<'w, 's> = Query<
+    'w,
+    's,
+    (&'static GlobalTransform, &'static Projection),
+    (With<UsdCamera>, Without<Camera3d>),
+>;
 
 /// Measures the stage once it is ready, and fits the clip planes and shadows to it.
 #[expect(
@@ -296,8 +350,10 @@ fn record(
     target: Res<Target>,
     fit: Option<Res<Fit>>,
     states: Query<&UsdSceneState>,
-    mut roots: Query<&mut UsdInstanceTime, With<UsdSceneRoot>>,
-    mut cameras: Query<&mut Transform, With<Camera3d>>,
+    instances: NonSend<UsdInstances>,
+    mut roots: Query<(Entity, &mut UsdInstanceTime), With<UsdSceneRoot>>,
+    mut cameras: Query<(&mut Transform, &mut Projection), With<Camera3d>>,
+    stage_cameras: StageCameras,
     mut exit: MessageWriter<AppExit>,
 ) {
     match states.iter().next() {
@@ -324,16 +380,43 @@ fn record(
         exit.write(AppExit::Success);
         return;
     }
-    if !recorder.posed {
-        let frame = &recorder.frames[recorder.next];
-        for mut time in &mut roots {
-            time.current = frame.time;
+    let frame = &recorder.frames[recorder.next];
+    if let FrameCamera::Prim(prim) = &frame.camera {
+        // Each frame, for a stage's camera may move with the new time.
+        let looked = roots
+            .iter()
+            .find_map(|(root, _)| instances.entity(root, prim))
+            .and_then(|entity| stage_cameras.get(entity).ok());
+        let Some((placed, projection)) = looked else {
+            eprintln!("the stage holds no camera at {prim}");
+            exit.write(AppExit::error());
+            return;
+        };
+        for (mut transform, mut own) in &mut cameras {
+            *transform = placed.compute_transform();
+            *own = projection.clone();
         }
-        let (eye, focus) = frame
-            .camera
-            .unwrap_or_else(|| (fit.center + VIEW.normalize() * fit.span * 1.1, fit.center));
-        for mut transform in &mut cameras {
-            *transform = Transform::from_translation(eye).looking_at(focus, Vec3::Y);
+    }
+    if !recorder.posed {
+        let start = roots
+            .iter()
+            .find_map(|(root, _)| instances.stage(root))
+            .map_or(0.0, openusd::usd::Stage::start_time_code);
+        let time = frame.time.unwrap_or(start);
+        let look = match &frame.camera {
+            FrameCamera::Stage => {
+                Some((fit.center + VIEW.normalize() * fit.span * 1.1, fit.center))
+            }
+            FrameCamera::Look(eye, focus) => Some((*eye, *focus)),
+            FrameCamera::Prim(_) => None,
+        };
+        for (_, mut current) in &mut roots {
+            current.current = time;
+        }
+        if let Some((eye, focus)) = look {
+            for (mut transform, _) in &mut cameras {
+                *transform = Transform::from_translation(eye).looking_at(focus, Vec3::Y);
+            }
         }
         recorder.posed = true;
         recorder.wait = recorder.wait.max(SETTLE);
@@ -385,19 +468,24 @@ mod tests {
 
     #[test]
     fn a_frame_frames_the_stage_or_names_its_camera() {
-        let frames = parse("0 a.png\n\n24.5 b.png 1 2 3 4 5 6\n").unwrap();
+        let frames = parse("0 a.png\n\n24.5 b.png 1 2 3 4 5 6\nstart c.png @/World/Cam\n").unwrap();
         assert_eq!(
             frames,
             [
                 Frame {
-                    time: 0.0,
+                    time: Some(0.0),
                     output: "a.png".into(),
-                    camera: None,
+                    camera: FrameCamera::Stage,
                 },
                 Frame {
-                    time: 24.5,
+                    time: Some(24.5),
                     output: "b.png".into(),
-                    camera: Some((Vec3::new(1.0, 2.0, 3.0), Vec3::new(4.0, 5.0, 6.0))),
+                    camera: FrameCamera::Look(Vec3::new(1.0, 2.0, 3.0), Vec3::new(4.0, 5.0, 6.0)),
+                },
+                Frame {
+                    time: None,
+                    output: "c.png".into(),
+                    camera: FrameCamera::Prim("/World/Cam".into()),
                 },
             ]
         );
@@ -408,5 +496,21 @@ mod tests {
         assert!(parse("0").is_err());
         assert!(parse("zero a.png").is_err());
         assert!(parse("0 a.png 1 2 3").is_err());
+    }
+
+    #[test]
+    fn variants_come_in_threes_after_their_flag() {
+        let args = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| (*word).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            parse_variants(&args(&["--variant", "/A", "look", "red"])).unwrap(),
+            [("/A".to_owned(), "look".to_owned(), "red".to_owned())]
+        );
+        assert!(parse_variants(&args(&["--variant", "/A", "look"])).is_err());
+        assert!(parse_variants(&args(&["--other", "/A", "look", "red"])).is_err());
     }
 }
