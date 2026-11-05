@@ -257,7 +257,8 @@ it. The root `Dockerfile` stays the check build.
 This repository's image also opts in to the GPU, with `ENV NVIDIA_VISIBLE_DEVICES=all` and
 `ENV NVIDIA_DRIVER_CAPABILITIES=all` and the libraries the driver's Vulkan needs. The factory template names the `nvidia`
 runtime class, which exposes no device by itself, so under it those two variables give this sandbox the device, with no
-Kubernetes claim. A repository whose image does not ask for it has no GPU.
+Kubernetes claim, and the installation's base policy admits the device nodes, which exist only then. A repository whose image
+does not ask for it has no GPU.
 
 ## Persistence
 
