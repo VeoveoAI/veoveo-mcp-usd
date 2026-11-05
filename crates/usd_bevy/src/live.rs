@@ -1508,9 +1508,22 @@ pub(crate) fn variant_scopes(
     Some((subtrees, exact))
 }
 
-/// Children of a variant spec: a `def` scopes its whole subtree, an `over`
-/// scopes itself and is walked for the specs beneath it. Variant specs are
-/// not prim specs, so this reads the layer's raw fields.
+/// The fields of an `over` that decide what lies beneath it, so that switching
+/// them can bring or take prims no spec in the variant names.
+const SUBTREE_FIELDS: [&str; 7] = [
+    "references",
+    "payload",
+    "inheritPaths",
+    "specializes",
+    "variantSetNames",
+    "variantSelection",
+    "active",
+];
+
+/// Children of a variant spec: a `def`, or an `over` with an arc or a change of
+/// activation, scopes its whole subtree; any other `over` scopes itself and is
+/// walked for the specs beneath it. Variant specs are not prim specs, so this
+/// reads the layer's raw fields.
 fn collect_variant_specs(
     data: &dyn openusd::sdf::AbstractData,
     spec_path: &openusd::sdf::Path,
@@ -1536,10 +1549,13 @@ fn collect_variant_specs(
             .ok()
             .flatten()
             .map(|value| value.into_owned());
-        if matches!(
+        let bounded = matches!(
             specifier,
             Some(openusd::vt::Value::Specifier(openusd::sdf::Specifier::Over))
-        ) {
+        ) && !SUBTREE_FIELDS
+            .iter()
+            .any(|field| data.try_field(&child_path, field).ok().flatten().is_some());
+        if bounded {
             exact.push(prim);
             collect_variant_specs(data, &child_path, subtrees, exact);
         } else {
@@ -1585,7 +1601,10 @@ fn reconcile_scoped(
         .map(|(p, e)| (p.to_string(), e))
         .collect();
     for (path, entity) in stale {
-        world.despawn(entity);
+        // A prim's despawn takes its children with it, which may be stale too.
+        if let Ok(entity) = world.get_entity_mut(entity) {
+            entity.despawn();
+        }
         map.remove_path(&path);
     }
 

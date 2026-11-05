@@ -267,6 +267,7 @@ pub fn read_preview_material_at(
         },
         SurfaceDialect::MaterialX => match shader_id.as_deref() {
             Some("ND_standard_surface_surfaceshader") => MATERIALX_STD_SURFACE_CHANNELS,
+            Some("ND_realitykit_unlit_surfaceshader") => REALITYKIT_UNLIT_CHANNELS,
             _ => PREVIEW_CHANNELS,
         },
         SurfaceDialect::Preview => match shader_id.as_deref() {
@@ -898,6 +899,10 @@ fn resolve_surface_shader(
         let attr_path = material.append_property(attr_name)?;
         if let Some(t) = connections_at(stage, &attr_path)?.into_iter().next() {
             let prim = t.prim_path();
+            // A connection to a shader that is not there says nothing, and another output may.
+            if !stage.prim(prim.clone())?.is_valid()? {
+                continue;
+            }
             if let Some(ids) = ids {
                 let id = read_token_or_string(stage, &prim, "info:id")?;
                 if !id.as_deref().is_some_and(|id| ids.contains(&id)) {
@@ -1162,6 +1167,20 @@ const MATERIALX_STD_SURFACE_CHANNELS: &[(&str, ColourSetter, ScalarSetter, Textu
         set_opacity_tex,
     ),
     ("normal", set_normal_c, set_normal_s, set_normal_tex),
+];
+
+/// RealityKit's unlit surface, the only surface a RealityKit material may have. Its graph adds
+/// its own lighting to `color`, so here `color` is the base color of a lit surface, and what only
+/// RealityKit can sample, such as the blurred background, falls back as any unresolved node does.
+const REALITYKIT_UNLIT_CHANNELS: &[(&str, ColourSetter, ScalarSetter, TextureSetter)] = &[
+    ("color", set_diffuse_c, set_diffuse_s, set_diffuse_tex),
+    ("opacity", set_opacity_c, set_opacity_s, set_opacity_tex),
+    (
+        "opacityThreshold",
+        set_opacity_threshold_c,
+        set_opacity_threshold_s,
+        set_opacity_threshold_tex,
+    ),
 ];
 
 const OMNIPBR_CHANNELS: &[(&str, ColourSetter, ScalarSetter, TextureSetter)] = &[
@@ -1461,6 +1480,16 @@ fn resolve_attr_chain_inner(
                         }),
                     ));
                 }
+                ShaderKind::Dot => {
+                    return resolve_attr_chain_inner(
+                        stage,
+                        &prim.append_property("inputs:in")?,
+                        remaining,
+                        warnings,
+                        time,
+                        depth + 1,
+                    );
+                }
                 ShaderKind::Constant => {
                     let v_path = prim.append_property("inputs:value")?;
                     return resolve_attr_chain_inner(
@@ -1656,6 +1685,8 @@ fn combine(
 enum ShaderKind {
     Texture,
     NormalMap,
+    /// MaterialX's pass-through node.
+    Dot,
     Constant,
     Multiply,
     Add,
@@ -1673,6 +1704,7 @@ fn shader_kind(stage: &Stage, prim: &Path) -> anyhow::Result<ShaderKind> {
         Some("PxrColorCorrect") => ShaderKind::ColorCorrect,
         Some(s) if s.starts_with("ND_image_") => ShaderKind::Texture,
         Some("ND_normalmap") => ShaderKind::NormalMap,
+        Some(s) if s.starts_with("ND_dot_") => ShaderKind::Dot,
         Some(s) if s.starts_with("ND_constant_") => ShaderKind::Constant,
         Some(s) if s.starts_with("ND_multiply_") => ShaderKind::Multiply,
         Some(s) if s.starts_with("ND_add_") => ShaderKind::Add,
@@ -2288,6 +2320,70 @@ def Material "Mat" {
                 .unwrap()
                 .as_str(),
             "/Default"
+        );
+    }
+
+    /// The chameleon's `Camo`: its `outputs:surface` connects to a shader that is not there, and
+    /// its RealityKit surface mixes the blurred background, which nothing here can sample, over
+    /// the texture.
+    #[test]
+    fn a_realitykit_surface_reads_its_color_through_the_graph() {
+        let source = crate::UsdSource::new(
+            "camo.usda",
+            &br#"#usda 1.0
+def Material "Mat" {
+    token outputs:mtlx:surface.connect = </Mat/Unlit.outputs:out>
+    token outputs:surface.connect = </Mat/Gone.outputs:surface>
+    def Shader "Unlit" {
+        uniform token info:id = "ND_realitykit_unlit_surfaceshader"
+        color3f inputs:color.connect = </Mat/Sum.outputs:out>
+        token outputs:out
+    }
+    def Shader "Sum" {
+        uniform token info:id = "ND_add_color3"
+        color3f inputs:in1.connect = </Mat/Blend.outputs:out>
+        color3f inputs:in2.connect = </Mat/Radiance.outputs:out>
+        color3f outputs:out
+    }
+    def Shader "Blend" {
+        uniform token info:id = "ND_mix_color3"
+        color3f inputs:bg.connect = </Mat/Pass.outputs:out>
+        color3f inputs:fg.connect = </Mat/Background.outputs:out>
+        color3f outputs:out
+    }
+    def Shader "Pass" {
+        uniform token info:id = "ND_dot_color3"
+        color3f inputs:in.connect = </Mat/Image.outputs:out>
+        color3f outputs:out
+    }
+    def Shader "Image" {
+        uniform token info:id = "ND_image_color3"
+        asset inputs:file = @0/skin.jpg@
+        color3f outputs:out
+    }
+    def Shader "Background" {
+        uniform token info:id = "ND_realitykit_background_blur_color3"
+        color3f outputs:out
+    }
+    def Shader "Radiance" {
+        uniform token info:id = "ND_realitykit_environment_radiance"
+        color3f outputs:out
+    }
+}
+"#[..],
+        )
+        .unwrap();
+        let stage = source.open_stage().unwrap();
+        let material = read_preview_material(&stage, &Path::new("/Mat").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            material
+                .diffuse_texture
+                .as_deref()
+                .is_some_and(|path| path.ends_with("0/skin.jpg")),
+            "{:?}",
+            material.diffuse_texture
         );
     }
 

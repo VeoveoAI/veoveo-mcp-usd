@@ -70,6 +70,20 @@ The ports differ from the examples in these ways:
 - **The viewer** loads one stage, named by its page's `scene` query, by path on its own origin. It drops the in-memory
   showcase and adds framing, and it reports its progress to its parent page.
 
+## Changes for variants and materials
+
+- **A variant's `over` with an arc scopes its subtree.** `collect_variant_specs` patched an `over` alone, so that a switch
+  leaves the rest alone. An `over` that adds a reference decides everything beneath it, and none of that is named in the variant: on Franka's
+  `Gripper` the old mesh stayed, and the new one never came. An `over` holding an arc, or `active`, now scopes its whole subtree.
+- **A source takes files by the path it named them.** `missing_dependencies_under` answers paths relative to the asset root as it does to the
+  in-memory one, and `UsdSource::add_file` takes them back, so that the viewer can read what a selection names.
+- **A variant's texture is read when it is bound.** `decode_missing_textures` read only what the snapshot held, so a render of Franka's
+  `Mesh=Quality` failed on a texture the default selections do not name. It now asks the source's fetcher as well.
+- **A surface output connected to nothing, and RealityKit's unlit surface.** The chameleon's `Camo` connects `outputs:surface` to a shader that
+  is not there, which `resolve_surface_shader` took as the surface, so it drew white. It now tries the next output, here `outputs:mtlx:surface`.
+  `ND_realitykit_unlit_surfaceshader` reads `color` as a lit surface's base color, since its graph adds its own lighting, and `ND_dot_*`,
+  MaterialX's pass-through, reads `in`.
+
 ## Changes for scrubbing and memory
 
 A new time on the hummingbird took 8.7 to 9.7 s, measured by `perf` on the 4090 box, and 64% of all the samples in the run were

@@ -976,7 +976,7 @@ fn decode_missing_textures(
     );
     for (path, srgb) in missing {
         let bytes = source
-            .read_asset(&path)
+            .read_or_fetch_asset(&path)
             .map_err(|error| anyhow::anyhow!("cannot read texture {path}: {error}"))?;
         let inner = openusd::ar::split_package_relative_path_inner(&path)
             .map(|(_, inner)| inner)
@@ -1818,6 +1818,164 @@ def Xform "Model" (
         spawn_usd_scenes(&mut world);
         assert!(world.non_send::<UsdInstances>().stage(root).unwrap() == &before);
         instance_entity(&world, root, "/Model/Loader");
+    }
+
+    /// Each selection references the geometry through an `over` that names none of
+    /// what the reference brings, as Franka's `Gripper` does.
+    #[test]
+    fn a_switch_of_reference_matches_a_fresh_stage() {
+        let part = |name: &str, scale: f32| {
+            format!(
+                r#"#usda 1.0
+(defaultPrim = "Part")
+def Xform "Part" {{
+    def Mesh "{name}" {{
+        float3 xformOp:scale = ({scale}, {scale}, {scale})
+        uniform token[] xformOpOrder = ["xformOp:scale"]
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+    }}
+}}
+"#
+            )
+        };
+        let root = r#"#usda 1.0
+def Xform "Model" (
+    variants = { string tool = "plain" }
+    prepend variantSets = "tool"
+) {
+    def "geometry" (instanceable = true) {}
+    variantSet "tool" = {
+        "plain" { over "geometry" (prepend references = @plain.usda@) {} }
+        "flex" { over "geometry" (prepend references = @flex.usda@) {} }
+        "none" {}
+    }
+}
+"#;
+        let source = UsdSource::from_memory(
+            "model.usda",
+            [
+                ("model.usda", root.to_owned()),
+                ("plain.usda", part("Plain", 0.01)),
+                ("flex.usda", part("Flex", 0.5)),
+            ]
+            .map(|(path, text)| (path, text.into_bytes())),
+        )
+        .unwrap();
+        let tool = |selection: &str| UsdInstanceOverrides {
+            variants: vec![("/Model".into(), "tool".into(), selection.into())],
+            ..default()
+        };
+        let prims = |world: &World, root: Entity| {
+            let mut prims: Vec<_> = world
+                .non_send::<UsdInstances>()
+                .prims(root)
+                .map(|(path, entity)| {
+                    (
+                        path.to_owned(),
+                        world.get::<Transform>(entity).map(|t| t.scale),
+                    )
+                })
+                .collect();
+            prims.sort_by(|a, b| a.0.cmp(&b.0));
+            prims
+        };
+        let (mut world, handle) = instance_world();
+        world
+            .resource_mut::<Assets<UsdScene>>()
+            .get_mut(&handle)
+            .unwrap()
+            .source = source.clone();
+        let live = world.spawn(UsdSceneRoot(handle.clone())).id();
+        spawn_usd_scenes(&mut world);
+        assert!(
+            world
+                .non_send::<UsdInstances>()
+                .entity(live, "/Model/geometry/Plain")
+                .is_some()
+        );
+        // Each switch ends as a stage opened with that selection does, and so does going back.
+        for selection in ["none", "flex", "none", "plain", "flex", "plain"] {
+            world.entity_mut(live).insert(tool(selection));
+            spawn_usd_scenes(&mut world);
+            let fresh = world
+                .spawn((UsdSceneRoot(handle.clone()), tool(selection)))
+                .id();
+            spawn_usd_scenes(&mut world);
+            assert_eq!(prims(&world, live), prims(&world, fresh), "{selection}");
+            world.entity_mut(fresh).despawn();
+            spawn_usd_scenes(&mut world);
+        }
+    }
+
+    /// A browser reads what a selection names first, and the stage takes the files and the
+    /// selection together, keeping the entities of what stays.
+    #[test]
+    fn a_selection_with_its_files_matches_a_fresh_stage() {
+        let root = r#"#usda 1.0
+def Xform "Model" (
+    variants = { string tool = "none" }
+    prepend variantSets = "tool"
+) {
+    def "geometry" {}
+    def Xform "Body" {}
+    variantSet "tool" = {
+        "none" {}
+        "flex" { over "geometry" (prepend references = @flex.usda@) {} }
+    }
+}
+"#;
+        let flex = br#"#usda 1.0
+(defaultPrim = "Part")
+def Xform "Part" { def Xform "Flex" {} }
+"#;
+        let tool = UsdInstanceOverrides {
+            variants: vec![("/Model".into(), "tool".into(), "flex".into())],
+            ..default()
+        };
+        let (mut world, handle) = instance_world();
+        world
+            .resource_mut::<Assets<UsdScene>>()
+            .get_mut(&handle)
+            .unwrap()
+            .source =
+            UsdSource::from_memory("model.usda", [("model.usda", root.as_bytes())]).unwrap();
+        let live = world.spawn(UsdSceneRoot(handle.clone())).id();
+        spawn_usd_scenes(&mut world);
+        let body = instance_entity(&world, live, "/Model/Body");
+        {
+            let mut scenes = world.resource_mut::<Assets<UsdScene>>();
+            let mut scene = scenes.get_mut(&handle).unwrap();
+            assert_eq!(
+                scene.source.missing_dependencies_under(&tool),
+                ["flex.usda"]
+            );
+            scene
+                .source
+                .add_file("flex.usda", Some(flex.as_slice().into()));
+            assert!(scene.source.missing_dependencies_under(&tool).is_empty());
+        }
+        world.entity_mut(live).insert(tool.clone());
+        spawn_usd_scenes(&mut world);
+        assert_eq!(
+            world.get::<UsdSceneState>(live),
+            Some(&UsdSceneState::Ready)
+        );
+        assert_eq!(instance_entity(&world, live, "/Model/Body"), body);
+        instance_entity(&world, live, "/Model/geometry/Flex");
+        let fresh = world.spawn((UsdSceneRoot(handle), tool)).id();
+        spawn_usd_scenes(&mut world);
+        let prims = |root: Entity| {
+            let mut prims: Vec<_> = world
+                .non_send::<UsdInstances>()
+                .prims(root)
+                .map(|(path, _)| path.to_owned())
+                .collect();
+            prims.sort();
+            prims
+        };
+        assert_eq!(prims(live), prims(fresh));
     }
 
     #[test]

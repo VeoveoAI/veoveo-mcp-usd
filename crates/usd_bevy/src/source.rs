@@ -235,6 +235,18 @@ impl UsdSource {
         .read_all()
     }
 
+    /// [`Self::read_asset`], or read by this source's fetcher: a variant can bind a texture that
+    /// nothing the loader composed asked for.
+    pub(crate) fn read_or_fetch_asset(&self, identifier: &str) -> io::Result<Vec<u8>> {
+        self.read_asset(identifier).or_else(|error| {
+            self.fetch
+                .as_ref()
+                .and_then(|fetch| fetch.read_now(identifier))
+                .map(|bytes| bytes.to_vec())
+                .ok_or(error)
+        })
+    }
+
     /// `default_composition` requires a freshly opened stage without overrides or edits.
     pub(crate) fn texture_requests(
         &self,
@@ -466,7 +478,7 @@ impl UsdSource {
     /// lacks. In-memory paths come back relative, as `from_memory` takes them;
     /// sources that fall back to the filesystem report none.
     pub fn missing_dependencies(&self) -> Vec<String> {
-        Self::relative_to_memory(self.probe_stage().1)
+        self.relative_to_root(self.probe_stage().1)
     }
 
     /// [`Self::missing_dependencies`] with `overrides` applied too, for a variant can
@@ -484,11 +496,33 @@ impl UsdSource {
             }
         }
         let missing = std::mem::take(&mut *requests.lock().expect("dependency requests"));
-        Self::relative_to_memory(missing)
+        self.relative_to_root(missing)
     }
 
-    fn relative_to_memory(identifiers: BTreeSet<String>) -> Vec<String> {
-        let base = absolute(Path::new(MEMORY_ROOT)).ok();
+    /// Gives this snapshot a file [`Self::missing_dependencies_under`] named, by the path it
+    /// gave. `None` says the file cannot be read, so composition stops asking for it.
+    pub fn add_file(&mut self, path: &str, bytes: Option<Arc<[u8]>>) {
+        let identifier = self.files_root().map_or_else(
+            || path.to_owned(),
+            |root| root.join(path).to_string_lossy().into_owned(),
+        );
+        match bytes {
+            Some(bytes) => self.insert_dependency(identifier, bytes),
+            None => self.mark_absent(identifier),
+        }
+    }
+
+    /// The virtual folder this snapshot's files sit under, if it has one: an in-memory
+    /// source's, or the one a stage read through Bevy's assets resolves under.
+    fn files_root(&self) -> Option<PathBuf> {
+        [MEMORY_ROOT, crate::asset::ASSET_ROOT]
+            .into_iter()
+            .filter_map(|root| absolute(Path::new(root)).ok())
+            .find(|root| Path::new(&self.identifier).starts_with(root))
+    }
+
+    fn relative_to_root(&self, identifiers: BTreeSet<String>) -> Vec<String> {
+        let base = self.files_root();
         identifiers
             .into_iter()
             .map(|identifier| {
@@ -3168,6 +3202,89 @@ def Scope "Model" (
         assert!(error.to_string().contains("missing.usda"));
         crate::authoring::set_variant(&stage, "/Model", "choice", "good").unwrap();
         UsdSource::validate_composition(&stage).unwrap();
+    }
+
+    /// A browser reads what a selection names round by round, each file by the path its asset
+    /// source knows it by, and a file it cannot read does not stop the rest.
+    #[test]
+    fn a_selection_gathers_its_files_by_their_asset_paths() {
+        let root = absolute(Path::new(crate::asset::ASSET_ROOT)).unwrap();
+        let mut source = UsdSource::snapshot(
+            root.join("scene/root.usda"),
+            &br#"#usda 1.0
+def Xform "Model" (
+    variants = { string tool = "none" }
+    prepend variantSets = "tool"
+) {
+    def "geometry" {}
+    variantSet "tool" = {
+        "none" {}
+        "flex" { over "geometry" (prepend references = [@parts/flex.usda@, @parts/gone.usda@]) {} }
+    }
+}
+"#[..],
+        )
+        .unwrap();
+        let files = std::collections::BTreeMap::from([
+            (
+                "scene/parts/flex.usda",
+                "#usda 1.0\n(defaultPrim = \"Flex\")\ndef Xform \"Flex\" (prepend references = @deep/part.usda@) {}\n",
+            ),
+            (
+                "scene/parts/deep/part.usda",
+                "#usda 1.0\n(defaultPrim = \"Part\")\ndef Xform \"Part\" { def Xform \"Deep\" {} }\n",
+            ),
+        ]);
+        let overrides = crate::instance::UsdInstanceOverrides {
+            variants: vec![("/Model".into(), "tool".into(), "flex".into())],
+            ..Default::default()
+        };
+        assert!(source.missing_dependencies().is_empty());
+        let mut asked = Vec::new();
+        for _ in 0..8 {
+            let missing = source.missing_dependencies_under(&overrides);
+            if missing.is_empty() {
+                break;
+            }
+            for file in missing {
+                let bytes = files
+                    .get(file.as_str())
+                    .map(|text| Arc::from(text.as_bytes()));
+                source.add_file(&file, bytes);
+                asked.push(file);
+            }
+        }
+        asked.sort();
+        assert_eq!(
+            asked,
+            [
+                "scene/parts/deep/part.usda",
+                "scene/parts/flex.usda",
+                "scene/parts/gone.usda"
+            ]
+        );
+        assert!(source.missing_dependencies_under(&overrides).is_empty());
+        let stage = source.open_stage().unwrap();
+        overrides.apply(&stage).unwrap();
+        assert!(
+            stage
+                .prim(openusd::sdf::path("/Model/geometry/Deep").unwrap())
+                .unwrap()
+                .is_valid()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_fetching_source_reads_a_file_nothing_composed_asked_for() {
+        let mut source = UsdSource::snapshot("fetching.usda", &b"#usda 1.0\n"[..]).unwrap();
+        let identifier = absolute(Path::new("texture.png")).unwrap();
+        let identifier = identifier.to_str().unwrap();
+        assert!(source.read_or_fetch_asset(identifier).is_err());
+        source.set_fetch(Fetcher::new(Arc::new(|_: &str| {
+            Some(Arc::<[u8]>::from(&b"pixels"[..]))
+        })));
+        assert_eq!(source.read_or_fetch_asset(identifier).unwrap(), b"pixels");
     }
 
     #[test]
