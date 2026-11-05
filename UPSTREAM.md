@@ -69,3 +69,16 @@ The ports differ from the examples in these ways:
 - **The render** drops the overlays, the streaming mode and `usdview`'s environment, and refuses a software adapter.
 - **The viewer** loads one stage, named by its page's `scene` query, by path on its own origin. It drops the in-memory
   showcase and adds framing, and it reports its progress to its parent page.
+
+## Changes for scrubbing and memory
+
+A new time on the hummingbird took 8.7 to 9.7 s, measured by `perf` on the 4090 box, and 64% of all the samples in the run were
+under `SchemaRegistry::patch_prim` in `route::material::resolve_material`, packing the same textures again: the material route
+ran on every animated prim at every new time, and its memo's key held the time.
+
+| File | Change |
+|---|---|
+| `src/route/material.rs` | `ProjectionMaterials` keys a material none of whose inputs vary under no time. `across_times` keeps a memo for a root that samples new times, emptied when the stage changes, and `begin_time` forgets varying results of earlier times |
+| `src/instance.rs` | `tick` samples new times with that memo, kept on the root as `sampling_materials`. `UsdInstances::load_payload` and `unload_payload` reach a root's live stage, for the viewer's panel |
+| `src/live.rs`, `src/asset.rs` | A finished projection job hands its memo to the root, so the first new time resolves nothing again |
+| `src/route/sampling.rs` | 8-bit mip chains are built in place from the level above, through tables of sRGB light, with no `f32` copy of a level. The copy took four bytes for each channel of the top level, which is memory a browser never gives back, and most of a load's CPU |

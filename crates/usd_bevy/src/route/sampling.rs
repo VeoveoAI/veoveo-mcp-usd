@@ -147,6 +147,11 @@ fn add_mips(image: &mut Image) {
     if w < 2 && h < 2 || data.len() != w * h * size {
         return;
     }
+    if let Kind::Srgb8 | Kind::Unorm8 = kind {
+        add_mips_8bit(data, (w, h), channels, matches!(kind, Kind::Srgb8));
+        image.texture_descriptor.mip_level_count = 1 + w.max(h).ilog2();
+        return;
+    }
     let mut level: Vec<f32> = data
         .chunks_exact(kind.bytes())
         .enumerate()
@@ -175,6 +180,100 @@ fn add_mips(image: &mut Image) {
         levels += 1;
     }
     image.texture_descriptor.mip_level_count = levels;
+}
+
+/// Appends the mip chain of 8-bit texels, each level from the one above it, with
+/// no copy of a level: a browser's memory never shrinks, so a stage's largest
+/// allocation stays its size for good.
+fn add_mips_8bit(data: &mut Vec<u8>, (mut w, mut h): (usize, usize), channels: usize, srgb: bool) {
+    let lut = srgb.then(SrgbTables::new);
+    let mut levels = vec![(w, h)];
+    let mut total = data.len();
+    while w > 1 || h > 1 {
+        (w, h) = ((w / 2).max(1), (h / 2).max(1));
+        levels.push((w, h));
+        total += w * h * channels;
+    }
+    data.resize(total, 0);
+    let mut start = 0;
+    for pair in levels.windows(2) {
+        let ((w, h), (nw, nh)) = (pair[0], pair[1]);
+        let length = w * h * channels;
+        let (above, below) = data[start..].split_at_mut(length);
+        for y in 0..nh {
+            let (y0, y1) = ((2 * y).min(h - 1), (2 * y + 1).min(h - 1));
+            for x in 0..nw {
+                let (x0, x1) = ((2 * x).min(w - 1), (2 * x + 1).min(w - 1));
+                let corners = [
+                    (y0 * w + x0) * channels,
+                    (y0 * w + x1) * channels,
+                    (y1 * w + x0) * channels,
+                    (y1 * w + x1) * channels,
+                ];
+                for c in 0..channels {
+                    let at = |corner: usize| above[corners[corner] + c];
+                    below[(y * nw + x) * channels + c] = match &lut {
+                        Some(lut) if c != 3 => lut.average([at(0), at(1), at(2), at(3)]),
+                        _ => {
+                            ((u16::from(at(0))
+                                + u16::from(at(1))
+                                + u16::from(at(2))
+                                + u16::from(at(3))
+                                + 2)
+                                / 4) as u8
+                        }
+                    };
+                }
+            }
+        }
+        start += length;
+    }
+}
+
+/// sRGB code values to 16-bit light and back, for averaging texels as light.
+struct SrgbTables {
+    light: [u16; 256],
+    code: Vec<u8>,
+}
+
+impl SrgbTables {
+    /// The steps of the light-to-code table: fine enough that the darkest code
+    /// values, where the curve is steepest, are off by at most one.
+    const STEPS: usize = 1 << 13;
+
+    fn new() -> Self {
+        let mut light = [0; 256];
+        for (code, light) in light.iter_mut().enumerate() {
+            let value = code as f32 / 255.0;
+            let linear = if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            };
+            *light = (linear * 65535.0).round() as u16;
+        }
+        let code = (0..Self::STEPS)
+            .map(|step| {
+                let linear = step as f32 / (Self::STEPS - 1) as f32;
+                let value = if linear <= 0.0031308 {
+                    linear * 12.92
+                } else {
+                    1.055 * linear.powf(1.0 / 2.4) - 0.055
+                };
+                (value * 255.0).round() as u8
+            })
+            .collect();
+        Self { light, code }
+    }
+
+    fn average(&self, codes: [u8; 4]) -> u8 {
+        let sum: u32 = codes
+            .iter()
+            .map(|code| u32::from(self.light[usize::from(*code)]))
+            .sum();
+        let mean = (sum + 2) / 4;
+        self.code[mean as usize * (Self::STEPS - 1) / 65535]
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -276,6 +375,15 @@ mod tests {
         add_mips(&mut texels);
         // Half the light of white is code value 188, not 128.
         assert_eq!(texels.data.unwrap()[8], 188);
+    }
+
+    #[test]
+    fn the_light_tables_round_trip_every_code_value() {
+        let tables = SrgbTables::new();
+        for code in 0..=255_u8 {
+            let mean = tables.average([code; 4]);
+            assert!(mean.abs_diff(code) <= 1, "{code} came back as {mean}");
+        }
     }
 
     #[test]

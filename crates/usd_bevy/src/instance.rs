@@ -7,6 +7,7 @@ use openusd::usd::Stage;
 
 use crate::asset::SnapshotTextures;
 use crate::live::{AnimatedPrims, LiveStage, PrimEntities, apply_changes, prim_is_animated};
+use crate::route::material::ProjectionMaterials;
 use crate::route::{SchemaRegistry, StageTime};
 
 /// An attribute opinion reapplied after source reloads.
@@ -138,6 +139,20 @@ impl UsdInstances {
         self.roots.get(&root).map(|runtime| &runtime.live.stage)
     }
 
+    /// Loads the payload of `prim` on `root`'s stage; the live loop projects what it brings.
+    pub fn load_payload(&self, root: Entity, prim: &str) {
+        if let Some(runtime) = self.roots.get(&root) {
+            runtime.live.load_payload(prim);
+        }
+    }
+
+    /// Unloads the payload of `prim` on `root`'s stage; the live loop despawns what it brought.
+    pub fn unload_payload(&self, root: Entity, prim: &str) {
+        if let Some(runtime) = self.roots.get(&root) {
+            runtime.live.unload_payload(prim);
+        }
+    }
+
     pub fn entity(&self, root: Entity, path: &str) -> Option<Entity> {
         self.roots.get(&root)?.map.entity(path)
     }
@@ -190,6 +205,8 @@ pub(crate) struct InstanceRuntime {
     >,
     /// Material memo for variant switches on this runtime's own stage.
     pub materials: Option<crate::route::material::ProjectionMaterials>,
+    /// Material memo for sampling new times on this runtime's own stage.
+    pub sampling_materials: Option<crate::route::material::ProjectionMaterials>,
     /// Units and pending work of a root with [`UsdStreaming`](crate::streaming::UsdStreaming).
     pub streaming: Option<crate::streaming::StreamingState>,
 }
@@ -509,6 +526,14 @@ pub(crate) fn tick(world: &mut World, instances: &mut UsdInstances) {
         }
         if current != runtime.sampled {
             let registry = world.resource::<SchemaRegistry>().clone();
+            // A material none of whose inputs vary resolves once across all times.
+            let other_memo = world.remove_non_send::<ProjectionMaterials>();
+            let mut memo = runtime
+                .sampling_materials
+                .take()
+                .unwrap_or_else(|| ProjectionMaterials::across_times(&runtime.live.stage));
+            memo.begin_time();
+            world.insert_non_send(memo);
             for (path, entity) in runtime.map.iter() {
                 let Ok(path) = openusd::sdf::path(path) else {
                     continue;
@@ -516,6 +541,10 @@ pub(crate) fn tick(world: &mut World, instances: &mut UsdInstances) {
                 if path.as_str() != "/" && prim_is_animated(&runtime.live.stage, &path) {
                     registry.patch_prim(&runtime.live.stage, &path, world, entity, &[]);
                 }
+            }
+            runtime.sampling_materials = world.remove_non_send::<ProjectionMaterials>();
+            if let Some(memo) = other_memo {
+                world.insert_non_send(memo);
             }
             runtime.sampled = current;
             crate::route::residency::materialize(world, &runtime.live.stage, &runtime.map);

@@ -792,6 +792,7 @@ pub(crate) fn spawn_usd_scenes(world: &mut World) {
                         job,
                         parked: default(),
                         materials: None,
+                        sampling_materials: None,
                         streaming,
                     },
                 );
@@ -1059,6 +1060,9 @@ fn continue_projections(
             world.insert_resource(previous);
         }
         if done {
+            runtime.sampling_materials = job
+                .take_materials()
+                .map(crate::route::material::ProjectionMaterials::kept_across_times);
             runtime.job = None;
             if let Ok(mut e) = world.get_entity_mut(root) {
                 e.insert(UsdSceneState::Ready);

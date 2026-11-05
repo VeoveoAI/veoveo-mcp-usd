@@ -930,7 +930,6 @@ impl ProjectionJob {
         budget: std::time::Duration,
     ) -> bool {
         let Some(traversal) = self.traversal.as_mut() else {
-            self.materials = None;
             return true;
         };
         let own_materials = self.materials.take();
@@ -980,15 +979,18 @@ impl ProjectionJob {
             crate::route::residency::materialize(world, stage, map);
         }
         if owns_materials {
-            let materials = world.remove_non_send::<crate::route::material::ProjectionMaterials>();
-            if !finished {
-                self.materials = materials;
-            }
+            // A finished job leaves its memo for the root to take to its next times.
+            self.materials = world.remove_non_send::<crate::route::material::ProjectionMaterials>();
             if let Some(previous) = previous_materials {
                 world.insert_non_send(previous);
             }
         }
         finished
+    }
+
+    /// The materials this job resolved, once it is done.
+    pub(crate) fn take_materials(&mut self) -> Option<crate::route::material::ProjectionMaterials> {
+        self.materials.take()
     }
 
     /// Prims projected so far and a lower bound on the total, which grows as

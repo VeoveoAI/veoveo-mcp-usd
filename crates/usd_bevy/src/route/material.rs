@@ -148,9 +148,10 @@ fn material_at(
         .ok_or_else(|| anyhow::anyhow!("unsupported material surface at {binding}"))
 }
 
-/// Materials resolved while one projection job runs. The gprims of a stage
-/// mostly share a few materials, and resolving one packs its textures, so
-/// the job keeps each (binding, time, sidedness) result until it finishes.
+/// Materials resolved while one projection job runs, or while one root samples
+/// new times. The gprims of a stage mostly share a few materials, and resolving
+/// one packs its textures, so the memo keeps each (binding, time, sidedness)
+/// result, under no time for a material none of whose inputs vary.
 /// Non-send because it pins the stage it belongs to.
 pub(crate) struct ProjectionMaterials {
     stage: openusd::usd::Stage,
@@ -158,6 +159,10 @@ pub(crate) struct ProjectionMaterials {
         (String, Option<u64>, bool),
         (Handle<StandardMaterial>, Vec<String>, MaterialColor),
     >,
+    /// Whether each binding's inputs vary with time.
+    varying: std::collections::HashMap<String, bool>,
+    /// Set when the stage changes, for a memo that lives across frames.
+    dirty: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     /// Whether any layer authors a `material:binding` property; without one
     /// no prim can be bound.
     binds: bool,
@@ -170,11 +175,57 @@ impl ProjectionMaterials {
         let mut memo = Self {
             stage: stage.clone(),
             resolved: Default::default(),
+            varying: Default::default(),
+            dirty: None,
             binds: false,
             scanned: 0,
         };
         memo.rescan();
         memo
+    }
+
+    /// A memo for a root that samples new times. It lives as long as the root,
+    /// so any change to the stage empties it.
+    pub(crate) fn across_times(stage: &openusd::usd::Stage) -> Self {
+        Self::new(stage).kept_across_times()
+    }
+
+    /// This memo, for a root to keep as it samples new times.
+    pub(crate) fn kept_across_times(mut self) -> Self {
+        let dirty = std::rc::Rc::new(std::cell::Cell::new(false));
+        let changed = dirty.clone();
+        self.stage.add_sink(
+            move |_: &openusd::usd::Stage, _: &openusd::usd::CommittedChange<'_>| changed.set(true),
+        );
+        self.dirty = Some(dirty);
+        self
+    }
+
+    /// Before sampling a new time: forgets what the stage's changes made stale,
+    /// and the results of varying materials at earlier times.
+    pub(crate) fn begin_time(&mut self) {
+        if self
+            .dirty
+            .as_ref()
+            .is_some_and(|dirty| dirty.replace(false))
+        {
+            self.resolved.clear();
+            self.varying.clear();
+            self.binds = false;
+            self.scanned = 0;
+            self.rescan();
+        }
+        self.resolved.retain(|key, _| key.1.is_none());
+    }
+
+    /// The time a result for `binding` holds at: none unless its inputs vary.
+    fn time_of(&mut self, binding: &openusd::sdf::Path, time: Option<f64>) -> Option<u64> {
+        let stage = &self.stage;
+        self.varying
+            .entry(binding.to_string())
+            .or_insert_with(|| crate::read::shade::material_is_time_varying(stage, binding))
+            .then_some(())
+            .and(time.map(f64::to_bits))
     }
 
     /// Looks for bindings in layers loaded since the last scan.
@@ -574,7 +625,12 @@ pub(crate) fn resolve_material(
     let Some(binding) = binding? else {
         return Ok(None);
     };
-    let key = memo_key(ctx, &binding);
+    let mut key = memo_key(ctx, &binding);
+    if let Some(mut memo) = world.get_non_send_mut::<ProjectionMaterials>()
+        && memo.stage == *ctx.stage
+    {
+        key.1 = memo.time_of(&binding, ctx.time);
+    }
     if profiling {
         world.resource_mut::<MaterialResolveTimings>().observe(&key);
     }
@@ -1038,6 +1094,57 @@ def Cube "C" { rel material:binding = </Mat> }
         let mut map = crate::live::PrimEntities::default();
         crate::live::project_stage(&mut world, &live, &mut map);
         assert!(world.get_non_send::<ProjectionMaterialReads>().is_none());
+    }
+
+    #[test]
+    fn a_still_material_holds_at_every_time_and_a_change_empties_the_memo() {
+        const STAGE: &str = r#"#usda 1.0
+def Material "Still" {
+    token outputs:surface.connect = </Still/Surface.outputs:surface>
+    def Shader "Surface" {
+        uniform token info:id = "UsdPreviewSurface"
+        color3f inputs:diffuseColor = (1, 0, 0)
+        token outputs:surface
+    }
+}
+def Material "Moving" {
+    token outputs:surface.connect = </Moving/Surface.outputs:surface>
+    def Shader "Surface" {
+        uniform token info:id = "UsdPreviewSurface"
+        color3f inputs:diffuseColor.timeSamples = { 0: (1, 0, 0), 10: (0, 1, 0) }
+        token outputs:surface
+    }
+}
+"#;
+        let stage = crate::UsdSource::snapshot("times.usda", STAGE.as_bytes())
+            .unwrap()
+            .open_stage()
+            .unwrap();
+        let still = openusd::sdf::path("/Still").unwrap();
+        let moving = openusd::sdf::path("/Moving").unwrap();
+        let mut memo = ProjectionMaterials::across_times(&stage);
+        assert_eq!(memo.time_of(&still, Some(1.0)), None);
+        assert_eq!(memo.time_of(&still, Some(2.0)), None);
+        assert_eq!(memo.time_of(&moving, Some(1.0)), Some(1.0_f64.to_bits()));
+        let result = (Handle::default(), vec![], MaterialColor::Open);
+        memo.resolved
+            .insert(("/Still".to_owned(), None, false), result.clone());
+        memo.resolved.insert(
+            ("/Moving".to_owned(), Some(1.0_f64.to_bits()), false),
+            result,
+        );
+        memo.begin_time();
+        assert_eq!(memo.resolved.len(), 1, "a varying result holds at one time");
+        stage
+            .prim(still.clone())
+            .unwrap()
+            .set_type_name("Scope")
+            .unwrap();
+        memo.begin_time();
+        assert!(
+            memo.resolved.is_empty(),
+            "a change to the stage empties the memo"
+        );
     }
 
     #[test]
