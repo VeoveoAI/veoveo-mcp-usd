@@ -153,7 +153,9 @@ Drag orbits, scroll zooms, and neither reaches the stage while the pointer is ov
 and to the console, as `{"usdViewer":{"state":...}}` messages: `started`, `loading`, `ready`, `measured`, `seeked` (a new
 time, with how long it took to show) and `failed`.
 
-A hidden tab draws nothing and makes no progress, because the browser stops the animation frames the app runs on; see the
+A variant switches on the loaded stage, and the browser cannot read a file while it composes, so a selection that names a layer
+the default selections did not load shows without it. `render_stage` gathers what its selections name, so it has no such limit.
+What the viewer measured, and a hidden tab, are in the
 [record](https://github.com/VeoveoAI/veoveo-docs/blob/main/records/2026-11-05-usd-server-and-viewer.md).
 
 ## Skills
