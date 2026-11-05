@@ -36,3 +36,10 @@ Left out: `assets/external`, `media`, `src` (`usdview`) and its dependency `mara
   - `live::tests::loads_kitchen_usdz`, on `assets/external/Kitchen_set.usdz`
 
   Both scenes go into the `usd-demo` Lore repository.
+- **No patched `bevy_asset`.** Upstream's `vendor/bevy_asset` serializes loads of one source, so that an older snapshot
+  never lands after a newer one during hot reload. Nothing here reloads a source while it loads, so it is left out. Its two
+  own tests, the only two that fail without it, are removed:
+  - `asset::tests::bevy_reload_serializes_source_reads_without_blocking_other_sources`
+  - `asset::tests::bevy_reload_serializes_older_successful_source_reads`
+
+  Hot reload is therefore unordered here, if anything ever uses it.
