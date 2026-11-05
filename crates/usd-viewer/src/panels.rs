@@ -4,13 +4,14 @@ use bevy::{camera::Projection, prelude::*};
 use bevy_egui::{EguiContexts, egui};
 use openusd::{sdf::Path, usd::Stage};
 use usd_bevy::{
-    UsdPrimRef, UsdScene, UsdSceneRoot, UsdSceneState,
+    UsdPrimRef, UsdScene, UsdSceneInstance, UsdSceneRoot, UsdSceneState,
     instance::{UsdInstanceOverrides, UsdInstanceTime, UsdInstances, UsdPlayback},
     read::variants::{variant_options, variant_selections},
     route::camera::UsdCamera,
 };
 
 use crate::{
+    reads::VariantReads,
     scenes::{self, Scenes},
     viewer::{Seek, memory_bytes, now_ms},
 };
@@ -22,6 +23,10 @@ const MAX_ROWS: usize = 400;
 const OPEN_ROWS: usize = 16;
 /// How many stage time codes one step of the time buttons moves.
 const STEP: f64 = 1.0;
+/// The widest the slider's value and label are, beside it.
+const TIME_FIELDS: f32 = 120.0;
+/// The most decimals the time shows.
+const TIME_DECIMALS: usize = 2;
 
 /// One variant set on one prim.
 pub struct VariantRow {
@@ -35,7 +40,7 @@ pub struct VariantRow {
 #[derive(Resource, Default)]
 pub struct Facts {
     read: bool,
-    /// Set when a panel changed the stage's composition.
+    /// Set when a panel changed which payloads the stage holds.
     stale: bool,
     start: f64,
     end: f64,
@@ -78,17 +83,18 @@ impl CameraChoice {
     }
 }
 
-/// Reads the stage's facts when it is ready, and after a panel changes it.
+/// Reads the stage's facts when it is ready, and after its composition changes: a variant switch
+/// marks the root's instance when it lands, whichever of the two runs first in a frame.
 pub fn read_facts(
     mut facts: ResMut<Facts>,
     instances: NonSend<UsdInstances>,
-    roots: Query<(Entity, &UsdSceneState, &UsdSceneRoot)>,
+    roots: Query<(Entity, &UsdSceneState, &UsdSceneRoot, Ref<UsdSceneInstance>)>,
     scenes: Res<Assets<UsdScene>>,
 ) {
-    let Some((root, UsdSceneState::Ready, handle)) = roots.iter().next() else {
+    let Some((root, UsdSceneState::Ready, handle, instance)) = roots.iter().next() else {
         return;
     };
-    if facts.read && !facts.stale {
+    if facts.read && !facts.stale && !instance.is_changed() {
         return;
     }
     let Some(stage) = instances.stage(root) else {
@@ -197,6 +203,7 @@ pub fn show(
     mut choice: ResMut<CameraChoice>,
     mut seek: ResMut<Seek>,
     mut over: ResMut<OverPanels>,
+    mut reads: ResMut<VariantReads>,
     scene_list: Res<Scenes>,
     instances: NonSend<UsdInstances>,
     time: Res<Time>,
@@ -205,7 +212,7 @@ pub fn show(
         &UsdSceneState,
         &mut UsdInstanceTime,
         &mut UsdPlayback,
-        &mut UsdInstanceOverrides,
+        &UsdInstanceOverrides,
     )>,
     cameras: Query<(Entity, &UsdPrimRef), With<UsdCamera>>,
 ) -> Result {
@@ -241,7 +248,7 @@ pub fn show(
             });
         });
     over.0 |= pointer.is_some_and(|pointer| left.response.rect.contains(pointer));
-    let Some((entity, state, mut current, mut playback, mut overrides)) = root else {
+    let Some((entity, state, mut current, mut playback, overrides)) = root else {
         return Ok(());
     };
     let right = egui::Panel::right("composition")
@@ -252,11 +259,7 @@ pub fn show(
                     ui,
                     format!("Variants ({})", facts.variants.len()),
                     facts.variants.len() <= OPEN_ROWS,
-                    |ui| {
-                        if show_variants(ui, &facts, &mut overrides) {
-                            facts.stale = true;
-                        }
-                    },
+                    |ui| show_variants(ui, &facts, overrides, &mut reads),
                 );
                 section(
                     ui,
@@ -288,19 +291,6 @@ pub fn show(
             if ui.add_enabled(moving, egui::Button::new(">")).clicked() {
                 asked = (asked + STEP).min(facts.end);
             }
-            ui.spacing_mut().slider_width = (ui.available_width() - 260.0).max(120.0);
-            ui.add_enabled(
-                moving,
-                egui::Slider::new(&mut asked, facts.start..=facts.end).text("time"),
-            );
-            if asked != current.current {
-                playback.playing = false;
-                current.current = asked;
-                if seek.asked.is_none() {
-                    seek.asked = Some(now_ms());
-                    seek.frames = 0;
-                }
-            }
             let status = match &*state {
                 UsdSceneState::Loading => "loading".to_owned(),
                 UsdSceneState::Failed(error) => format!("failed: {error}"),
@@ -310,6 +300,31 @@ pub fn show(
                     memory_bytes() / 1_048_576.0
                 ),
             };
+            let status_width = ui
+                .painter()
+                .layout_no_wrap(
+                    status.clone(),
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    egui::Color32::PLACEHOLDER,
+                )
+                .size()
+                .x;
+            ui.spacing_mut().slider_width =
+                (ui.available_width() - status_width - TIME_FIELDS).max(120.0);
+            ui.add_enabled(
+                moving,
+                egui::Slider::new(&mut asked, facts.start..=facts.end)
+                    .max_decimals(TIME_DECIMALS)
+                    .text("time"),
+            );
+            if asked != current.current {
+                playback.playing = false;
+                current.current = asked;
+                if seek.asked.is_none() {
+                    seek.asked = Some(now_ms());
+                    seek.frames = 0;
+                }
+            }
             ui.label(status);
         });
     });
@@ -393,12 +408,30 @@ fn tree(ui: &mut egui::Ui, stage: &Stage, path: &Path, selection: &mut Selection
     }
 }
 
-/// Whether a variant changed.
-fn show_variants(ui: &mut egui::Ui, facts: &Facts, overrides: &mut UsdInstanceOverrides) -> bool {
-    let mut changed = false;
+/// Each variant set, whose choice goes to the reads ahead of the stage.
+fn show_variants(
+    ui: &mut egui::Ui,
+    facts: &Facts,
+    overrides: &UsdInstanceOverrides,
+    reads: &mut VariantReads,
+) {
     if facts.variants.is_empty() {
         ui.small("This stage has no variant sets.");
     }
+    if reads.busy() {
+        ui.small("Reading the selection's files.");
+    }
+    ui.add_enabled_ui(!reads.busy(), |ui| {
+        show_variant_rows(ui, facts, overrides, reads)
+    });
+}
+
+fn show_variant_rows(
+    ui: &mut egui::Ui,
+    facts: &Facts,
+    overrides: &UsdInstanceOverrides,
+    reads: &mut VariantReads,
+) {
     for row in &facts.variants {
         ui.small(row.prim.as_str());
         let mut selected = row.selection.clone();
@@ -411,16 +444,16 @@ fn show_variants(ui: &mut egui::Ui, facts: &Facts, overrides: &mut UsdInstanceOv
             });
         ui.label(row.set.as_str());
         if selected != row.selection {
-            overrides
+            let mut wanted = overrides.clone();
+            wanted
                 .variants
                 .retain(|(prim, set, _)| *prim != row.prim || *set != row.set);
-            overrides
+            wanted
                 .variants
                 .push((row.prim.clone(), row.set.clone(), selected));
-            changed = true;
+            reads.ask(wanted);
         }
     }
-    changed
 }
 
 /// Whether a payload was loaded or unloaded.

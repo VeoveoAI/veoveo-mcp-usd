@@ -144,17 +144,19 @@ own compiler, which a browser refuses, so the viewer replaces it with a copy wit
 |---|---|
 | Scenes | The item's scenes; choosing one opens it |
 | Prims | The stage's tree, read lazily; choosing a prim selects it and shows its type |
-| Variants | Each variant set on the stage's prims, with its options; choosing one sets `UsdInstanceOverrides`, and the live stage reconciles |
+| Variants | Each variant set on the stage's prims, with its options; choosing one reads what it names and sets `UsdInstanceOverrides`, and the live stage reconciles |
 | Payloads | Each prim with a payload, and whether it is loaded; a toggle loads or unloads it |
 | Time | A slider over the stage's time range, the time code, and play and pause through `UsdPlayback` |
 | Cameras | Each `UsdGeomCamera`, and the free orbit camera; choosing one looks through it, and dragging returns to free orbit |
 
 Drag orbits, scroll zooms, and neither reaches the stage while the pointer is over a panel. It reports to its parent page,
 and to the console, as `{"usdViewer":{"state":...}}` messages: `started`, `loading`, `ready`, `measured`, `seeked` (a new
-time, with how long it took to show) and `failed`.
+time, with how long it took to show), `selected` (a variant, with how long it took to reach the stage) and `failed`.
 
-A variant switches on the loaded stage, and the browser cannot read a file while it composes, so a selection that names a layer
-the default selections did not load shows without it. `render_stage` gathers what its selections name, so it has no such limit.
+A variant switches on the loaded stage, and the browser cannot read a file while it composes. So choosing one first composes the
+source under that selection to learn which files it names and lacks, reads them from the origin by their relative paths, and repeats until
+nothing it can read is missing, as `stage::gather` does for a render. The stage then takes the files and the selection together, and shows without
+a file that could not be read. A stage with nothing to read switches in place. A package holds all it may name, so a stage in one skips this.
 What the viewer measured, and a hidden tab, are in the
 [record](https://github.com/VeoveoAI/veoveo-docs/blob/main/records/2026-11-05-usd-server-and-viewer.md).
 

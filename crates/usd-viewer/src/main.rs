@@ -4,6 +4,8 @@
 #[cfg(target_arch = "wasm32")]
 mod panels;
 #[cfg(target_arch = "wasm32")]
+mod reads;
+#[cfg(target_arch = "wasm32")]
 mod scenes;
 #[cfg(target_arch = "wasm32")]
 mod viewer;

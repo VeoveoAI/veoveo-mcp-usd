@@ -27,6 +27,7 @@ use wasm_bindgen::{JsCast, JsValue};
 
 use crate::{
     panels::{self, CameraChoice, Facts, OverPanels, Selection},
+    reads::{self, VariantReads},
     scenes,
 };
 
@@ -108,6 +109,7 @@ pub fn run() {
     .init_resource::<Selection>()
     .init_resource::<CameraChoice>()
     .init_resource::<OverPanels>()
+    .init_resource::<VariantReads>()
     .insert_resource(scenes::start())
     .insert_resource(DisplayPurposes {
         render: true,
@@ -124,6 +126,7 @@ pub fn run() {
             orbit,
             panels::read_facts,
             panels::look_through,
+            reads::apply,
         ),
     )
     .add_systems(EguiPrimaryContextPass, panels::show)
