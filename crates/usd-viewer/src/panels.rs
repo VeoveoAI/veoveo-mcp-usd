@@ -284,7 +284,10 @@ pub fn show(
             if ui.add_enabled(moving, egui::Button::new(label)).clicked() {
                 playback.playing = !playback.playing;
             }
-            let mut asked = current.current;
+            // The slider rounds what it is given. Someone asked for another time only when
+            // the controls differ from that rounded time, not from the exact one playing.
+            let shown = egui::emath::round_to_decimals(current.current, TIME_DECIMALS);
+            let mut asked = shown;
             if ui.add_enabled(moving, egui::Button::new("<")).clicked() {
                 asked = (asked - STEP).max(facts.start);
             }
@@ -317,7 +320,7 @@ pub fn show(
                     .max_decimals(TIME_DECIMALS)
                     .text("time"),
             );
-            if asked != current.current {
+            if asked != shown {
                 playback.playing = false;
                 current.current = asked;
                 if seek.asked.is_none() {
