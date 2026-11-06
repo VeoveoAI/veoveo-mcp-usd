@@ -19,7 +19,7 @@ use crate::{
     contract::{StageThumbnail, ThumbnailRequest, ThumbnailSize},
     hub::{HubError, Probe, Reader},
     scenes::Scenes,
-    stage::{self, Scope},
+    stage::{self, Scope, StageError},
     work::{self, FRAME},
 };
 
@@ -89,7 +89,32 @@ impl Thumbnails {
         let Ok(_permit) = self.permits.acquire().await else {
             return Ok(StageThumbnail::default());
         };
-        match self.draw(reader, request, &probe, &key, scenes).await {
+        let gathered = match stage::gather(
+            reader,
+            &request.repository,
+            &request.branch,
+            &request.path,
+            Scope::Everything,
+            &UsdInstanceOverrides::default(),
+        )
+        .await
+        {
+            Ok(gathered) => gathered,
+            // That the files could not be read now says nothing of the stage.
+            Err(StageError::Hub(error)) => {
+                tracing::warn!(%error, "a stage could not be read to draw it");
+                return Ok(StageThumbnail::default());
+            }
+            Err(error) => {
+                tracing::warn!(%error, "a stage's picture could not be drawn");
+                let _ = tokio::fs::write(self.failed_path(&key), b"").await;
+                return Ok(StageThumbnail::default());
+            }
+        };
+        match self
+            .draw(reader, request, gathered, &probe, &key, scenes)
+            .await
+        {
             Ok(()) => Ok(self.kept(&key, request.size).await.unwrap_or_default()),
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "a stage's picture could not be drawn");
@@ -121,7 +146,7 @@ impl Thumbnails {
     }
 
     fn failed_path(&self, key: &str) -> PathBuf {
-        self.directory.join(format!("{key}.failed"))
+        self.directory.join(format!("{key}.draw-failed"))
     }
 
     /// The small picture kept of a stage with this content on this tip, drawing nothing.
@@ -214,20 +239,11 @@ impl Thumbnails {
         &self,
         reader: &Reader,
         request: &ThumbnailRequest,
+        gathered: stage::Gathered,
         probe: &Probe,
         key: &str,
         scenes: &Scenes,
     ) -> anyhow::Result<()> {
-        let gathered = stage::gather(
-            reader,
-            &request.repository,
-            &request.branch,
-            &request.path,
-            Scope::Everything,
-            &UsdInstanceOverrides::default(),
-        )
-        .await
-        .context("reading the stage")?;
         let read: Vec<String> = gathered.files.keys().cloned().collect();
         let absent: Vec<String> = gathered.missing.iter().cloned().collect();
         let folder = tempfile::tempdir().context("making the picture's temporary folder")?;

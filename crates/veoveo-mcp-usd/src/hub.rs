@@ -159,6 +159,23 @@ pub struct Probe {
     pub revision: Option<String>,
 }
 
+/// Sends a read, and again when it got no answer at all: a read changes nothing, and a connection
+/// can drop between requests. One that ran out of time has had its time.
+async fn read(
+    request: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    for wait in [200, 1000] {
+        match request().send().await {
+            Err(error) if !error.is_timeout() => {
+                tracing::debug!(error = %error.without_url(), "a read got no answer");
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+            }
+            answered => return answered,
+        }
+    }
+    request().send().await
+}
+
 fn revision_of(response: &reqwest::Response) -> Option<String> {
     response
         .headers()
@@ -225,14 +242,14 @@ impl Hub {
 impl Reader {
     async fn get(&self, url: url::Url, timeout: Duration) -> Result<reqwest::Response, HubError> {
         let bearer = self.client.hub_bearer().await?;
-        let response = self
-            .hub
-            .http
-            .get(url)
-            .bearer_auth(bearer.expose())
-            .timeout(timeout)
-            .send()
-            .await?;
+        let response = read(|| {
+            self.hub
+                .http
+                .get(url.clone())
+                .bearer_auth(bearer.expose())
+                .timeout(timeout)
+        })
+        .await?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);
@@ -312,16 +329,16 @@ impl Reader {
             .hub
             .files_route(&self.profile, repository, branch, path.split('/'));
         let bearer = self.client.hub_bearer().await?;
-        let response = self
-            .hub
-            .http
-            .get(url)
-            .bearer_auth(bearer.expose())
-            .header(ACCEPT, "application/octet-stream")
-            .header(RANGE, "bytes=0-0")
-            .timeout(LISTING_TIMEOUT)
-            .send()
-            .await?;
+        let response = read(|| {
+            self.hub
+                .http
+                .get(url.clone())
+                .bearer_auth(bearer.expose())
+                .header(ACCEPT, "application/octet-stream")
+                .header(RANGE, "bytes=0-0")
+                .timeout(LISTING_TIMEOUT)
+        })
+        .await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.bytes().await?;
@@ -354,15 +371,15 @@ impl Reader {
             .hub
             .files_route(&self.profile, repository, branch, path.split('/'));
         let bearer = self.client.hub_bearer().await?;
-        let response = self
-            .hub
-            .http
-            .get(url)
-            .bearer_auth(bearer.expose())
-            .header(ACCEPT, "application/octet-stream")
-            .timeout(FILE_TIMEOUT)
-            .send()
-            .await?;
+        let response = read(|| {
+            self.hub
+                .http
+                .get(url.clone())
+                .bearer_auth(bearer.expose())
+                .header(ACCEPT, "application/octet-stream")
+                .timeout(FILE_TIMEOUT)
+        })
+        .await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.bytes().await?;
