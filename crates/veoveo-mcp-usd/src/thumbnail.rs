@@ -3,7 +3,7 @@
 //! each one and a person without a grant learns nothing from what is kept. What is kept is only
 //! a small picture of a stage, under a name its content decides, and any of it can be drawn again.
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
     time::{Duration, SystemTime},
@@ -18,6 +18,7 @@ use usd_bevy::instance::UsdInstanceOverrides;
 use crate::{
     contract::{StageThumbnail, ThumbnailRequest, ThumbnailSize},
     hub::{HubError, Probe, Reader},
+    scenes::Scenes,
     stage::{self, Scope},
     work::{self, FRAME},
 };
@@ -63,6 +64,7 @@ impl Thumbnails {
         &self,
         reader: &Reader,
         request: &ThumbnailRequest,
+        scenes: &Scenes,
     ) -> Result<StageThumbnail, HubError> {
         let probe = reader
             .probe(&request.repository, &request.branch, request.path.as_str())
@@ -79,10 +81,15 @@ impl Thumbnails {
         if let Some(found) = self.kept(&key, request.size).await {
             return Ok(found);
         }
+        if self.reuse(reader, request, &probe, &key, scenes).await
+            && let Some(found) = self.kept(&key, request.size).await
+        {
+            return Ok(found);
+        }
         let Ok(_permit) = self.permits.acquire().await else {
             return Ok(StageThumbnail::default());
         };
-        match self.draw(reader, request, &key).await {
+        match self.draw(reader, request, &probe, &key, scenes).await {
             Ok(()) => Ok(self.kept(&key, request.size).await.unwrap_or_default()),
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "a stage's picture could not be drawn");
@@ -139,6 +146,59 @@ impl Thumbnails {
         })
     }
 
+    /// A new tip need not mean a new picture. What a stage read when it was drawn is noted beside
+    /// its picture, and when each of those files is unchanged, and each it looked for is still not
+    /// there, the picture stands for this tip too.
+    async fn reuse(
+        &self,
+        reader: &Reader,
+        request: &ThumbnailRequest,
+        probe: &Probe,
+        key: &str,
+        scenes: &Scenes,
+    ) -> bool {
+        let Ok(noted) = tokio::fs::read(self.uses_path(probe, request.path.as_str())).await else {
+            return false;
+        };
+        let Ok(uses) = serde_json::from_slice::<Uses>(&noted) else {
+            return false;
+        };
+        let Ok(tip) = scenes
+            .at_tip(reader, &request.repository, &request.branch)
+            .await
+        else {
+            return false;
+        };
+        if !uses.unchanged(&tip.addresses) {
+            return false;
+        }
+        for size in [ThumbnailSize::Small, ThumbnailSize::Large] {
+            if tokio::fs::copy(self.path(&uses.key, size), self.path(key, size))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// What a stage's picture depends on, by the stage's content.
+    fn uses_path(&self, probe: &Probe, path: &str) -> PathBuf {
+        let mut hash = Sha256::new();
+        hash.update(RECIPE);
+        hash.update([0]);
+        hash.update(&probe.address);
+        hash.update([0]);
+        hash.update(path);
+        let name: String = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        self.directory.join(format!("{name}.uses"))
+    }
+
     async fn failed_lately(&self, key: &str) -> bool {
         let Ok(metadata) = tokio::fs::metadata(self.failed_path(key)).await else {
             return false;
@@ -154,7 +214,9 @@ impl Thumbnails {
         &self,
         reader: &Reader,
         request: &ThumbnailRequest,
+        probe: &Probe,
         key: &str,
+        scenes: &Scenes,
     ) -> anyhow::Result<()> {
         let gathered = stage::gather(
             reader,
@@ -166,6 +228,8 @@ impl Thumbnails {
         )
         .await
         .context("reading the stage")?;
+        let read: Vec<String> = gathered.files.keys().cloned().collect();
+        let absent: Vec<String> = gathered.missing.iter().cloned().collect();
         let folder = tempfile::tempdir().context("making the picture's temporary folder")?;
         let line = format!("start {}\n", folder.path().join(FRAME).display());
         anyhow::ensure!(
@@ -186,7 +250,54 @@ impl Thumbnails {
         let output = drawn.output;
         tokio::task::spawn_blocking(move || keep(&output, &small, &large))
             .await
-            .map_err(|error| anyhow!("{error}"))?
+            .map_err(|error| anyhow!("{error}"))??;
+        // A failure to note this only costs a later draw.
+        if let Ok(tip) = scenes
+            .at_tip(reader, &request.repository, &request.branch)
+            .await
+        {
+            let uses = Uses::of(key, read, absent, &tip.addresses);
+            if let Ok(noted) = serde_json::to_vec(&uses) {
+                let _ = tokio::fs::write(self.uses_path(probe, request.path.as_str()), noted).await;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What a drawn picture depends on: every file its stage read, with the content it had, and every
+/// file its stage looked for that was not there, as none.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Uses {
+    key: String,
+    files: BTreeMap<String, Option<String>>,
+}
+
+impl Uses {
+    fn of(
+        key: &str,
+        read: Vec<String>,
+        absent: Vec<String>,
+        addresses: &HashMap<String, String>,
+    ) -> Self {
+        let files = read
+            .into_iter()
+            .chain(absent)
+            .map(|path| {
+                let address = addresses.get(&path).cloned();
+                (path, address)
+            })
+            .collect();
+        Self {
+            key: key.to_owned(),
+            files,
+        }
+    }
+
+    fn unchanged(&self, addresses: &HashMap<String, String>) -> bool {
+        self.files
+            .iter()
+            .all(|(path, address)| addresses.get(path) == address.as_ref())
     }
 }
 
@@ -234,6 +345,42 @@ fn write_jpeg(image: &image::DynamicImage, path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_picture_stands_while_everything_its_stage_read_is_unchanged() {
+        let addresses = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(path, address)| ((*path).to_owned(), (*address).to_owned()))
+                .collect()
+        };
+        let then = addresses(&[
+            ("a/model.usdc", "1"),
+            ("a/t.png", "2"),
+            ("elsewhere.png", "3"),
+        ]);
+        let uses = Uses::of(
+            "k",
+            vec!["a/model.usdc".to_owned(), "a/t.png".to_owned()],
+            vec!["a/gone.png".to_owned()],
+            &then,
+        );
+        assert!(uses.unchanged(&then));
+        // Something the stage never read may change.
+        assert!(uses.unchanged(&addresses(&[
+            ("a/model.usdc", "1"),
+            ("a/t.png", "2"),
+            ("elsewhere.png", "9")
+        ])));
+        // What it read may not, nor may what it looked for appear, nor what it read go.
+        assert!(!uses.unchanged(&addresses(&[("a/model.usdc", "1"), ("a/t.png", "9")])));
+        assert!(!uses.unchanged(&addresses(&[
+            ("a/model.usdc", "1"),
+            ("a/t.png", "2"),
+            ("a/gone.png", "4")
+        ])));
+        assert!(!uses.unchanged(&addresses(&[("a/model.usdc", "1")])));
+    }
 
     fn probe(revision: &str) -> Probe {
         Probe {

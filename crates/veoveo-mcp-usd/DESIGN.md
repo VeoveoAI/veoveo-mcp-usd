@@ -130,6 +130,8 @@ Artifact and adds nothing to a person's library, which a render does.
 
 ### The Scene Browser
 
+A stage's picture is kept by its content and, unless it is a package, the branch's tip, since a layer it names may have changed. A new tip does not mean a new draw: what the stage read when it was drawn, and what it looked for and did not find, is noted beside its picture, and while all of that is unchanged the picture stands for the new tip too.
+
 A scene is found at any depth, from one read of the Hub's `/tree/` route per repository revision, held in memory: a folder with exactly one stage in it, or with a stage named for it beside other layers, known by the folder's name, and otherwise a stage on its own, known by its file's. `list_scenes` with `all` answers from what was last known of each repository the person holds a grant on, reads the ones not known yet, and looks at the others again after answering, at most once a minute. A page holds at most 120 scenes, finds names by `search`, and carries the small pictures already drawn, so a screen is one request.
 
 `ui://usd/scenes` is a gallery of every scene in the repositories the person can read, grouped by repository, with `list_scenes` and

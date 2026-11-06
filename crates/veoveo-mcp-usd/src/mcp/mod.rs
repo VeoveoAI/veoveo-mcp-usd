@@ -289,7 +289,7 @@ impl UsdMcp {
     ) -> Result<StageThumbnail, ToolError> {
         let reader = self.reader(&context)?;
         self.thumbnails
-            .thumbnail(&reader, &request)
+            .thumbnail(&reader, &request, &self.scenes)
             .await
             .map_err(|error| refused("reading the stage", error))
     }

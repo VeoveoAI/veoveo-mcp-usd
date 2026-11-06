@@ -39,6 +39,8 @@ pub struct Found {
 pub struct RepositoryScenes {
     pub revision: Option<String>,
     pub scenes: Vec<Found>,
+    /// Every file's content address, by its path.
+    pub addresses: HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -126,7 +128,15 @@ impl RepositoryScenes {
             }
         }
         scenes.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
-        Self { revision, scenes }
+        let addresses = entries
+            .iter()
+            .filter_map(|entry| Some((entry.path.clone(), entry.address.clone()?)))
+            .collect();
+        Self {
+            revision,
+            scenes,
+            addresses,
+        }
     }
 }
 
