@@ -330,6 +330,8 @@ fn fit(
     for light in &lights {
         commands.entity(light).insert(
             CascadeShadowConfigBuilder {
+                // Scaled too: the default of 0.1 is past the first bound of anything under 20 cm.
+                minimum_distance: span * 0.01,
                 first_cascade_far_bound: span * 0.5,
                 maximum_distance: span * 6.0,
                 ..default()

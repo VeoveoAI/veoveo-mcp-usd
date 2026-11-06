@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// Changes when what is drawn changes, so that older pictures are drawn again.
-const RECIPE: &str = "1";
+const RECIPE: &str = "2";
 /// The width of a small picture. A large one is the frame as it was rendered.
 const SMALL_WIDTH: u32 = 480;
 /// How long a stage that could not be drawn is left before it is tried again.
