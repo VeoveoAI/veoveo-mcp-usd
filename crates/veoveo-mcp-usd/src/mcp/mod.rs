@@ -4,8 +4,9 @@ mod requirements;
 mod setup;
 mod tasks;
 
+use futures::StreamExt as _;
 use rmcp::{ErrorData as McpError, RoleServer, model::ClientCapabilities, service::RequestContext};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use usd_bevy::instance::UsdInstanceOverrides;
 use veoveo_hub_sdk::{
     apps::{AppHtml, AppUri, UiVisibility},
@@ -21,8 +22,8 @@ use veoveo_mcp_artifact::contract::ArtifactPermission;
 use crate::{
     contract::{
         BranchName, DEFAULT_BRANCH, InspectStageRequest, ListScenesRequest, RenderStageRequest,
-        RenderedStage, RepositorySummary, SceneListing, StageReport, StageThumbnail,
-        ThumbnailRequest, UsdPermission,
+        RenderedStage, RepositorySummary, Scene, SceneListing, StagePath, StageReport,
+        StageThumbnail, ThumbnailRequest, UsdPermission,
     },
     hub::{Hub, HubError, Reader},
     stage::{self, Scope, StageError},
@@ -66,7 +67,19 @@ pub struct UsdMcp {
     hub: Hub,
     app: AppHtml,
     thumbnails: Thumbnails,
+    scenes: Scenes,
 }
+
+use crate::scenes::{RepositoryScenes, Scenes};
+
+/// How many scenes a page holds unless asked.
+const PAGE: u32 = 60;
+/// The most scenes one page holds.
+const MOST_ON_A_PAGE: u32 = 120;
+/// How many repositories are read at once.
+const READS_AT_ONCE: usize = 8;
+/// The most base64 one page answers. A page's other pictures are asked for afterwards.
+const MOST_PAGE_BYTES: usize = 3 * 1024 * 1024;
 
 impl UsdMcp {
     pub fn new(hub: Hub, app: AppHtml, thumbnails: Thumbnails) -> Self {
@@ -74,6 +87,7 @@ impl UsdMcp {
             hub,
             app,
             thumbnails,
+            scenes: Scenes::default(),
         }
     }
 
@@ -92,38 +106,159 @@ impl UsdMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<SceneListing, ToolError> {
         let reader = self.reader(&context)?;
-        let Some(repository) = request.repository else {
-            let mut repositories = reader
-                .repositories()
-                .await
-                .map_err(|error| refused("listing your repositories", error))?;
-            repositories.sort_by_key(|repository| repository.name.to_lowercase());
-            return Ok(SceneListing {
-                repositories: repositories
-                    .into_iter()
-                    .map(|repository| RepositorySummary {
-                        id: repository.id,
-                        name: repository.name,
-                    })
-                    .collect(),
-                repository: None,
-                branch: None,
-                scenes: vec![],
-            });
-        };
         let branch = match request.branch {
             Some(branch) => branch,
             None => BranchName::parse(DEFAULT_BRANCH).expect("the default branch's name"),
         };
-        let scenes = stage::scenes(&reader, &repository, &branch)
-            .await
-            .map_err(|error| refused("listing the repository's scenes", error))?;
+        let limit = request.limit.unwrap_or(PAGE).clamp(1, MOST_ON_A_PAGE) as usize;
+        let offset = match request.cursor.as_deref() {
+            None => 0,
+            Some(cursor) => cursor
+                .parse()
+                .map_err(|_| ToolError::Rejected("not a page of this listing".to_owned()))?,
+        };
+        let wanted = request
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|search| !search.is_empty())
+            .map(str::to_lowercase);
+        let holds = |name: &str| {
+            wanted
+                .as_ref()
+                .is_none_or(|wanted| name.to_lowercase().contains(wanted))
+        };
+        let (repository, gathered) = match request.repository {
+            Some(repository) => {
+                let scenes = self
+                    .scenes
+                    .at_tip(&reader, &repository, &branch)
+                    .await
+                    .map_err(|error| refused("listing the repository's scenes", error))?;
+                (Some(repository), vec![(None, scenes)])
+            }
+            None => {
+                let mut repositories = reader
+                    .repositories()
+                    .await
+                    .map_err(|error| refused("listing your repositories", error))?;
+                repositories.sort_by_key(|repository| repository.name.to_lowercase());
+                if !request.all {
+                    return Ok(SceneListing {
+                        repositories: repositories
+                            .into_iter()
+                            .map(|repository| RepositorySummary {
+                                id: repository.id,
+                                name: repository.name,
+                            })
+                            .collect(),
+                        repository: None,
+                        branch: None,
+                        scenes: vec![],
+                        total: None,
+                        next: None,
+                    });
+                }
+                (None, self.all_scenes(&reader, &branch, repositories).await)
+            }
+        };
+        let matching: Vec<_> = gathered
+            .iter()
+            .flat_map(|(owner, scenes)| {
+                scenes
+                    .scenes
+                    .iter()
+                    .filter(|scene| holds(&scene.name))
+                    .map(move |scene| (owner, scenes, scene))
+            })
+            .collect();
+        let total = matching.len();
+        let page: Vec<_> = matching.into_iter().skip(offset).take(limit).collect();
+        let mut left = MOST_PAGE_BYTES;
+        let mut scenes = Vec::with_capacity(page.len());
+        for (owner, held, scene) in page {
+            let Ok(path) = StagePath::parse(scene.path.as_str()) else {
+                continue;
+            };
+            let picture = self
+                .thumbnails
+                .ready(&scene.address, held.revision.as_deref(), &scene.path)
+                .await
+                .filter(|picture| {
+                    let bytes = picture.data.as_ref().map_or(0, String::len);
+                    left.checked_sub(bytes)
+                        .inspect(|rest| left = *rest)
+                        .is_some()
+                });
+            scenes.push(Scene {
+                name: scene.name.clone(),
+                path,
+                size: scene.size,
+                repository: owner.clone(),
+                picture,
+            });
+        }
+        let end = offset.saturating_add(limit);
         Ok(SceneListing {
             repositories: vec![],
-            repository: Some(repository),
+            repository,
             branch: Some(branch),
             scenes,
+            total: Some(total as u64),
+            next: (end < total).then(|| end.to_string()),
         })
+    }
+
+    /// Every repository's scenes: what was last known of one, which a person with a grant on it may
+    /// see, and the rest read now. What was last known is looked at again after the answer.
+    async fn all_scenes(
+        &self,
+        reader: &Reader,
+        branch: &BranchName,
+        repositories: Vec<crate::hub::Repository>,
+    ) -> Vec<(Option<RepositorySummary>, Arc<RepositoryScenes>)> {
+        let mut again = Vec::new();
+        let found: Vec<_> = futures::stream::iter(repositories)
+            .map(|repository| {
+                let known = self.scenes.latest(&repository.id, branch);
+                if let Some((_, true)) = &known {
+                    again.push(repository.id.clone());
+                }
+                async move {
+                    let scenes = match known {
+                        Some((scenes, _)) => Some(scenes),
+                        // A repository that cannot be read holds nothing to show here.
+                        None => self
+                            .scenes
+                            .at_tip(reader, &repository.id, branch)
+                            .await
+                            .ok(),
+                    };
+                    let owner = RepositorySummary {
+                        id: repository.id,
+                        name: repository.name,
+                    };
+                    scenes.map(|scenes| (Some(owner), scenes))
+                }
+            })
+            .buffered(READS_AT_ONCE)
+            .collect()
+            .await;
+        if !again.is_empty() {
+            let (scenes, reader, branch) = (self.scenes.clone(), reader.clone(), branch.clone());
+            tokio::spawn(async move {
+                futures::stream::iter(again)
+                    .for_each_concurrent(READS_AT_ONCE, |repository| {
+                        let (scenes, reader, branch) =
+                            (scenes.clone(), reader.clone(), branch.clone());
+                        async move {
+                            let _ = scenes.at_tip(&reader, &repository, &branch).await;
+                        }
+                    })
+                    .await;
+            });
+        }
+        found.into_iter().flatten().collect()
     }
 
     async fn inspect_stage(
@@ -194,7 +329,7 @@ static ROUTES: LazyLock<Routes<UsdMcp>> = LazyLock::new(|| {
         .public_route(VIEWER_ROUTE, 1, VIEWER_REQUESTS_PER_MINUTE)
         .viewer(&VIEWER_EXTENSIONS, VIEWER_ROUTE)
         .tool::<ListScenesRequest, _, _>(
-            "List the Lore repositories you can read or, given a `repository`, its scenes on a branch: its top-level folders whose root stage bears their name.",
+            "List the Lore repositories you can read or, given a `repository`, its scenes on a branch, at any depth: each folder with exactly one stage in it or a stage named for it, and any other stage. `all` lists every repository's scenes. Pages of at most 120, with `search` on their names.",
             policy(UsdPermission::StagesRead),
             |domain, request, context| async move { domain.list_scenes(request, context).await },
         )

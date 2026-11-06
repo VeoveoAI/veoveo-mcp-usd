@@ -25,6 +25,18 @@ pub struct ListScenesRequest {
     /// The branch to read; `main` by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<BranchName>,
+    /// The scenes of every repository you can read, instead of naming one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
+    /// Find scenes whose name holds this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    /// The `next` of the page before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// How many scenes, at most 120.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
 }
 
 /// A repository the caller can read.
@@ -39,13 +51,19 @@ pub struct RepositorySummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Scene {
-    /// The folder's name.
+    /// The folder's name, or the stage's when it has no folder of its own.
     pub name: String,
-    /// The root stage.
+    /// The stage to open.
     pub path: StagePath,
     /// The bytes of the folder, as the Hub lists them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// The repository it is in, when `all` asked for every repository's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositorySummary>,
+    /// Its small picture, when `all` or a page has one ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<StageThumbnail>,
 }
 
 /// What `list_scenes` answers: the repositories, or the scenes of one.
@@ -63,6 +81,12 @@ pub struct SceneListing {
     pub branch: Option<BranchName>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scenes: Vec<Scene>,
+    /// How many scenes there are in all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// Asks for the next page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 /// How large a thumbnail to draw.

@@ -1,45 +1,40 @@
-// The scenes a person can read, from every repository that holds one.
+// The scenes a person can read, from every repository that holds one, a page at a time. The server
+// finds them and answers the pictures that are ready with each page.
 veoveoGallery((ui) => {
-  const LISTS_AT_ONCE = 6;
+  const BRANCH = "main";
   /** The Hub's page for a file; each segment is encoded once. */
   const viewUrl = (repository, branch, path) => {
     const parts = ["view", "lore", repository, branch, ...path.split("/")];
     return `/${parts.map(encodeURIComponent).join("/")}`;
   };
-  /** Runs `work` over `items`, a few at a time, keeping their order. */
-  const inTurn = async (items, work) => {
-    const results = new Array(items.length);
-    let next = 0;
-    await Promise.all(Array.from({ length: Math.min(LISTS_AT_ONCE, items.length) }, async () => {
-      while (next < items.length) {
-        const index = next++;
-        results[index] = await work(items[index]);
-      }
-    }));
-    return results;
-  };
+  const keyOf = (scene) => `${scene.repository.id}\0${BRANCH}\0${scene.path}`;
   return {
     title: "USD scenes",
     aspect: "16 / 9",
-    list: async () => {
-      const { repositories = [] } = await ui.tool("list_scenes", {});
-      const found = await inTurn(repositories, async (repository) => {
-        // A repository that cannot be listed holds nothing to show here.
-        const listed = await ui.tool("list_scenes", { repository: repository.id }).catch(() => ({ scenes: [] }));
-        return (listed.scenes || []).map((scene) => ({
-          key: `${listed.repository}\0${listed.branch}\0${scene.path}`,
+    placeholder: "Search",
+    remoteSearch: true,
+    list: async ({ search, cursor }) => {
+      const asked = { all: true };
+      if (search) asked.search = search;
+      if (cursor) asked.cursor = cursor;
+      const { scenes = [], next } = await ui.tool("list_scenes", asked);
+      return {
+        items: scenes.map((scene) => ({
+          key: keyOf(scene),
           name: scene.name,
           kind: "scene",
           badge: "",
-          group: repository.name,
+          group: scene.repository.name,
           about: ui.size(scene.size),
-          fields: { repository, branch: listed.branch, ...scene },
-          repository: listed.repository,
-          branch: listed.branch,
+          fields: { repository: scene.repository, branch: BRANCH, path: scene.path, size: scene.size },
+          repository: scene.repository.id,
+          branch: BRANCH,
           path: scene.path,
-        }));
-      });
-      return { items: found.flat(), empty: "No repository you can read holds a scene." };
+        })),
+        next,
+        empty: "No repository you can read holds a scene.",
+        pictures: scenes.filter((scene) => scene.picture).map((scene) => ({ key: keyOf(scene), ...scene.picture })),
+      };
     },
     thumbnail: (item, size) => ui.tool("thumbnail", { repository: item.repository, branch: item.branch, path: item.path, size }, ui.PICTURE_TIMEOUT),
     open: (item) => viewUrl(item.repository, item.branch, item.path),

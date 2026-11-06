@@ -13,6 +13,8 @@ pub mod mcp;
 #[cfg(feature = "render")]
 pub mod render;
 #[cfg(feature = "server")]
+pub mod scenes;
+#[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "server")]
 pub mod stage;

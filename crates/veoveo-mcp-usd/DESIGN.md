@@ -63,7 +63,7 @@ The server answers these questions for a caller:
 
 | Surface | Name | Permission | Result |
 |---|---|---|---|
-| Tool | `list_scenes` | `usd.stages.read` | `SceneListing`: without a `repository`, the repositories the caller can read; with one, its scenes on `branch`, `main` by default, each with the path that opens it |
+| Tool | `list_scenes` | `usd.stages.read` | `SceneListing`: without a `repository`, the repositories the caller can read, or with `all`, every repository's scenes; with one, its scenes on `branch`, `main` by default, each with the path that opens it |
 | Tool | `inspect_stage` | `usd.stages.read` | `StageReport` |
 | Task tool | `render_stage` | `usd.stages.render` | `Product<RenderedStage>`, whose `resultUri` is the PNG's `artifact://artifacts/{id}` |
 | Tool, for Apps and servers | `thumbnail` | `usd.stages.read` | `StageThumbnail`: a JPEG of a stage in base64, `small`, 480 pixels wide, or `large`, 1280, or none when it cannot be drawn |
@@ -129,6 +129,8 @@ draw at once, each up to 180 seconds. A stage that cannot be drawn answers no pi
 Artifact and adds nothing to a person's library, which a render does.
 
 ### The Scene Browser
+
+A scene is found at any depth, from one read of the Hub's `/tree/` route per repository revision, held in memory: a folder with exactly one stage in it, or with a stage named for it beside other layers, known by the folder's name, and otherwise a stage on its own, known by its file's. `list_scenes` with `all` answers from what was last known of each repository the person holds a grant on, reads the ones not known yet, and looks at the others again after answering, at most once a minute. A page holds at most 120 scenes, finds names by `search`, and carries the small pictures already drawn, so a screen is one request.
 
 `ui://usd/scenes` is a gallery of every scene in the repositories the person can read, grouped by repository, with `list_scenes` and
 `thumbnail`. A repository with no scene does not appear. The look and the behavior are [veoveo-hub-ui](https://github.com/VeoveoAI/veoveo-hub-ui)'s

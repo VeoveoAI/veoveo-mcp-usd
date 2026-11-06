@@ -10,10 +10,10 @@ use usd_bevy::{UsdSource, instance::UsdInstanceOverrides};
 
 use crate::{
     contract::{
-        BranchName, MAX_LISTED, RepositoryId, STAGE_FORMAT, Scene, StagePath, StageReport,
-        TypeCount, VariantSetReport,
+        BranchName, MAX_LISTED, RepositoryId, STAGE_FORMAT, StagePath, StageReport, TypeCount,
+        VariantSetReport,
     },
-    hub::{EntryKind, HubError, Reader},
+    hub::{HubError, Reader},
 };
 
 /// How many requests to the Hub one read keeps open.
@@ -88,45 +88,6 @@ impl Gathered {
         )
         .map_err(|error| StageError::Compose(error.to_string()))
     }
-}
-
-/// The scenes of a branch: its top-level folders whose root stage bears their name.
-pub async fn scenes(
-    reader: &Reader,
-    repository: &RepositoryId,
-    branch: &BranchName,
-) -> Result<Vec<Scene>, HubError> {
-    let top = reader.listing(repository, branch, &[]).await?;
-    let found: Vec<Option<Scene>> = stream::iter(
-        top.entries
-            .into_iter()
-            .filter(|entry| entry.kind == EntryKind::Directory),
-    )
-    .map(|folder| async move {
-        let listing = reader
-            .listing(repository, branch, &[folder.name.as_str()])
-            .await?;
-        let root = LAYERS.iter().find_map(|extension| {
-            let name = format!("{}.{extension}", folder.name);
-            listing
-                .entries
-                .iter()
-                .any(|entry| entry.kind == EntryKind::File && entry.name == name)
-                .then_some(name)
-        });
-        Ok::<_, HubError>(root.and_then(|root| {
-            let path = StagePath::parse(format!("{}/{root}", folder.name)).ok()?;
-            Some(Scene {
-                name: folder.name.clone(),
-                path,
-                size: folder.size,
-            })
-        }))
-    })
-    .buffered(CONCURRENT_READS)
-    .try_collect()
-    .await?;
-    Ok(found.into_iter().flatten().collect())
 }
 
 /// Reads `path` and then what it names under `overrides`, composing again after each round until

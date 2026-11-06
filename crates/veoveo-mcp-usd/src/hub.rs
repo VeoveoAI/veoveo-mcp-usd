@@ -97,6 +97,29 @@ struct Repositories {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Listing {
     pub entries: Vec<Entry>,
+    /// The branch's tip it was read at.
+    #[serde(skip)]
+    pub revision: Option<String>,
+}
+
+/// Everything on a branch's tip.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Tree {
+    pub entries: Vec<TreeEntry>,
+    #[serde(skip)]
+    pub revision: Option<String>,
+}
+
+/// One name in a tree, by its whole path.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TreeEntry {
+    pub path: String,
+    #[serde(rename = "type")]
+    pub kind: EntryKind,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 /// One name in a folder.
@@ -134,6 +157,15 @@ pub struct Probe {
     pub address: String,
     /// The branch's tip when it was read.
     pub revision: Option<String>,
+}
+
+fn revision_of(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get("lore-revision")?
+        .to_str()
+        .ok()
+        .map(str::to_owned)
 }
 
 /// The Hub, for one caller at one profile.
@@ -236,8 +268,36 @@ impl Reader {
             folder.iter().copied().chain([""]),
         );
         let response = self.get(url, LISTING_TIMEOUT).await?;
+        let revision = revision_of(&response);
         let body = response.bytes().await?;
-        Ok(serde_json::from_slice(&body)?)
+        Ok(Listing {
+            revision,
+            ..serde_json::from_slice(&body)?
+        })
+    }
+
+    /// `GET /lore/{profile}/repositories/{id}/tree/{branch}`: everything on the branch's tip, by
+    /// one read.
+    pub async fn tree(
+        &self,
+        repository: &RepositoryId,
+        branch: &BranchName,
+    ) -> Result<Tree, HubError> {
+        let url = self.hub.route([
+            "lore",
+            self.profile.as_str(),
+            "repositories",
+            repository.as_str(),
+            "tree",
+            branch.as_str(),
+        ]);
+        let response = self.get(url, FILE_TIMEOUT).await?;
+        let revision = revision_of(&response);
+        let body = response.bytes().await?;
+        Ok(Tree {
+            revision,
+            ..serde_json::from_slice(&body)?
+        })
     }
 
     /// Reads one byte of a file as the caller, so Lore decides whether they may read it now, and

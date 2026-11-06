@@ -117,6 +117,20 @@ impl Thumbnails {
         self.directory.join(format!("{key}.failed"))
     }
 
+    /// The small picture kept of a stage with this content on this tip, drawing nothing.
+    pub async fn ready(
+        &self,
+        address: &str,
+        revision: Option<&str>,
+        path: &str,
+    ) -> Option<StageThumbnail> {
+        let probe = Probe {
+            address: address.to_owned(),
+            revision: revision.map(str::to_owned),
+        };
+        self.kept(&key(&probe, path), ThumbnailSize::Small).await
+    }
+
     async fn kept(&self, key: &str, size: ThumbnailSize) -> Option<StageThumbnail> {
         let bytes = tokio::fs::read(self.path(key, size)).await.ok()?;
         Some(StageThumbnail {
