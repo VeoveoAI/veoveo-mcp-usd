@@ -31,7 +31,7 @@ const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 /// The longest one picture may take.
 const DRAW_TIMEOUT: Duration = Duration::from_secs(180);
 /// How many stages draw at once. Each one composes the whole stage, on a GPU others use too.
-const CONCURRENT_DRAWS: usize = 2;
+const CONCURRENT_DRAWS: usize = 4;
 /// The quality of the pictures.
 const JPEG_QUALITY: u8 = 82;
 /// The media type of the pictures.
