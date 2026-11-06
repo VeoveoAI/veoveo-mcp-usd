@@ -33,7 +33,7 @@ veoveoGallery((ui) => {
           badge: "",
           group: repository.name,
           about: ui.size(scene.size),
-          detail: [ui.size(scene.size), `${repository.name}/${scene.path}`].filter(Boolean).join(" · "),
+          fields: { repository, branch: listed.branch, ...scene },
           repository: listed.repository,
           branch: listed.branch,
           path: scene.path,
