@@ -42,7 +42,7 @@ port         8806
 
 | Standard or protocol | Implemented profile |
 |---|---|
-| [Model Context Protocol](https://modelcontextprotocol.io/specification/) | Version `2026-07-28`, JSON-RPC 2.0 over Streamable HTTP, under the hosted MCP contract `https://veoveo.ai/contracts/hosted-mcp` that `veoveo-hub-sdk` 886cb6a implements over rmcp 3.8.0. The server exposes three tools, one of them a Task, one App, the documents and contract resources, typed structured content and one skill. |
+| [Model Context Protocol](https://modelcontextprotocol.io/specification/) | Version `2026-07-28`, JSON-RPC 2.0 over Streamable HTTP, under the hosted MCP contract `https://veoveo.ai/contracts/hosted-mcp` that `veoveo-hub-sdk` 5ff33f1 implements over rmcp 3.9.0. The server exposes three tools, one of them a Task, one App, the documents and contract resources, typed structured content and one skill. |
 | [MCP Tasks extension](https://github.com/modelcontextprotocol/ext-tasks) | `render_stage` runs as a durable Task in core's Task runtime, through the SDK's adapter. |
 | [MCP Apps](https://github.com/modelcontextprotocol/ext-apps) `2026-01-26` | `ui://usd/scenes`, in the host's ordinary frame, through the bridge. |
 | [MCP Skills extension](https://github.com/modelcontextprotocol/ext-skills) `io.modelcontextprotocol/skills`, SEP-2640, and the [Agent Skills](https://agentskills.io/specification) format | The skills under `skills/`, embedded at build time and served at `skill://usd/{name}/{path}` through the SDK; see [Skills](#skills) |

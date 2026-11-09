@@ -18,9 +18,9 @@ veoveo-task = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "a8dafe90
 veoveo-types = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "a8dafe90206d1cadbb1d2de26304fe061a542ffd" }
 # The Rust SDK for Veoveo MCP servers: the contract feature for declarations, the server
 # feature for hosting, registration and the forwarded identity.
-veoveo-hub-sdk = { git = "https://github.com/VeoveoAI/veoveo-hub-sdk", rev = "14a649f3e37dca39a4bb29fc39dd03c6565b0490", default-features = false }
+veoveo-hub-sdk = { git = "https://github.com/VeoveoAI/veoveo-hub-sdk", rev = "5ff33f1f669385099fdd405f6e6bbd6ee190a45c", default-features = false }
 # Artifact's client, which stores a render's PNG. It pins this SDK revision, so the two move together.
-veoveo-mcp-artifact = { git = "https://github.com/VeoveoAI/veoveo-mcp-artifact", rev = "0f6d50106ba3ac3a4e48f3677a743472ebe73a50", default-features = false }
+veoveo-mcp-artifact = { git = "https://github.com/VeoveoAI/veoveo-mcp-artifact", rev = "548dac1fcd4e23e87f8c6c4a9e43e011d5d6b637", default-features = false }
 
 # The App's look and its gallery.
 veoveo-hub-ui = { git = "https://github.com/VeoveoAI/veoveo-hub-ui", rev = "3000d65eccdbcdf23feb94acff9264b6df7b20c2" }
@@ -60,7 +60,7 @@ dotenvy = "0.15.7"
 # The SDK's HTTP client release; registration and the tests share it.
 reqwest = { version = "=0.13.5", default-features = false }
 # The rmcp fork the SDK pins; the tool router uses its macros.
-rmcp = { version = "=3.8.0", git = "https://github.com/VeoveoAI/rust-sdk", rev = "d45f7f5e43e910f818400ca702cc904c5682c213" }
+rmcp = { version = "=3.9.0", git = "https://github.com/VeoveoAI/rust-sdk", rev = "e8c8868f252b22835b960942d38a4b51182e0270" }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 secrecy = "0.10.3"
 tracing = "0.1.44"
