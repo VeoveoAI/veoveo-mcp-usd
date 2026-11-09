@@ -127,7 +127,7 @@ impl RepositoryScenes {
                 scenes.extend(found(stage_stem(file).unwrap_or(file), stage, stage.size));
             }
         }
-        scenes.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+        scenes.sort_by_key(|scene| scene.path.to_lowercase());
         let addresses = entries
             .iter()
             .filter_map(|entry| Some((entry.path.clone(), entry.address.clone()?)))
@@ -151,10 +151,13 @@ fn found(name: &str, stage: &TreeEntry, size: Option<u64>) -> Option<Found> {
 
 type Place = (RepositoryId, BranchName);
 
+/// A branch's scenes and when its tip was last asked for.
+type Held = HashMap<Place, (Arc<RepositoryScenes>, Instant)>;
+
 /// The latest scenes of each repository's branch.
 #[derive(Clone, Default)]
 pub struct Scenes {
-    held: Arc<Mutex<HashMap<Place, (Arc<RepositoryScenes>, Instant)>>>,
+    held: Arc<Mutex<Held>>,
     turns: Arc<Mutex<HashMap<Place, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
