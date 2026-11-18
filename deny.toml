@@ -6,7 +6,11 @@ all-features = true
 [advisories]
 # paste is unmaintained, with no vulnerability and no safe upgrade. It is a compile-time macro,
 # reached only through bevy_image, image, exr and pulp.
-ignore = [{ id = "RUSTSEC-2024-0436", reason = "unmaintained, compile-time only, through Bevy's image stack" }]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained, compile-time only, through Bevy's image stack" },
+    # Unmaintained with no vulnerability and no patched release; these go when the graph drops them.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, with no patched release; core and the SDK use it, and rmcp, schemars and sqlx depend on it" },
+]
 
 [licenses]
 # Licenses compatible with distributing an Apache-2.0 project. Add a license here only
