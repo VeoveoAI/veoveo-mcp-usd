@@ -20,7 +20,7 @@ veoveo-types = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "9be8fac
 # feature for hosting, registration and the forwarded identity.
 veoveo-hub-sdk = { git = "https://github.com/VeoveoAI/veoveo-hub-sdk", rev = "18a6e8c5f8a69ca57a6e12f8b752203574efa231", default-features = false }
 # Artifact's client, which stores a render's PNG. It pins this SDK revision, so the two move together.
-veoveo-mcp-artifact = { git = "https://github.com/VeoveoAI/veoveo-mcp-artifact", rev = "7db8a41e27a25ed3b0861b0f71a8ac30e695ad6b", default-features = false }
+veoveo-mcp-artifact = { git = "https://github.com/VeoveoAI/veoveo-mcp-artifact", rev = "3f264d0aad2cdde70065ec2dcb3b8b51720d9ad2", default-features = false }
 
 # The App's look and its gallery.
 veoveo-hub-ui = { git = "https://github.com/VeoveoAI/veoveo-hub-ui", rev = "3000d65eccdbcdf23feb94acff9264b6df7b20c2" }
