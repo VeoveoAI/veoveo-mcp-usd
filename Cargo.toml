@@ -13,14 +13,14 @@ publish = false
 [workspace.dependencies]
 tempfile = "=3.27.0"
 # veoveo-core, pinned to one revision for every core crate.
-veoveo-skills = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "9be8fac678163aae5cc76b87987282f739d5c2bc" }
-veoveo-task = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "9be8fac678163aae5cc76b87987282f739d5c2bc" }
-veoveo-types = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "9be8fac678163aae5cc76b87987282f739d5c2bc" }
+veoveo-skills = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "c8f16d85a3f15a865960a56b8a7d9ac68ca37088" }
+veoveo-task = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "c8f16d85a3f15a865960a56b8a7d9ac68ca37088" }
+veoveo-types = { git = "https://github.com/VeoveoAI/veoveo-core", rev = "c8f16d85a3f15a865960a56b8a7d9ac68ca37088" }
 # The Rust SDK for Veoveo MCP servers: the contract feature for declarations, the server
 # feature for hosting, registration and the forwarded identity.
-veoveo-hub-sdk = { git = "https://github.com/VeoveoAI/veoveo-hub-sdk", rev = "18a6e8c5f8a69ca57a6e12f8b752203574efa231", default-features = false }
+veoveo-hub-sdk = { git = "https://github.com/VeoveoAI/veoveo-hub-sdk", rev = "80dc604e9374471f8a40771668c1cb41ecb56f22", default-features = false }
 # Artifact's client, which stores a render's PNG. It pins this SDK revision, so the two move together.
-veoveo-mcp-artifact = { git = "https://github.com/VeoveoAI/veoveo-mcp-artifact", rev = "3f264d0aad2cdde70065ec2dcb3b8b51720d9ad2", default-features = false }
+veoveo-mcp-artifact = { git = "https://github.com/VeoveoAI/veoveo-mcp-artifact", rev = "dea841a6375be21bd3e84031579762430cfe8d34", default-features = false }
 
 # The App's look and its gallery.
 veoveo-hub-ui = { git = "https://github.com/VeoveoAI/veoveo-hub-ui", rev = "3000d65eccdbcdf23feb94acff9264b6df7b20c2" }
@@ -64,7 +64,7 @@ rmcp = { version = "=3.11.0", git = "https://github.com/VeoveoAI/rust-sdk", rev 
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 secrecy = "0.10.3"
 tracing = "0.1.44"
-url = "=2.5.8"
+url = "=2.5.9"
 
 schemars = { version = "1.2.2", features = ["uuid1"] }
 serde = { version = "=1.0.229", features = ["derive"] }

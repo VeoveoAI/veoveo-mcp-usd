@@ -176,20 +176,28 @@ impl UsdMcp {
         let page: Vec<_> = matching.into_iter().skip(offset).take(limit).collect();
         let mut left = MOST_PAGE_BYTES;
         let mut scenes = Vec::with_capacity(page.len());
-        for (owner, held, scene) in page {
+        for (owner, _held, scene) in page {
             let Ok(path) = StagePath::parse(scene.path.as_str()) else {
                 continue;
             };
-            let picture = self
-                .thumbnails
-                .ready(&scene.address, held.revision.as_deref(), &scene.path)
-                .await
-                .filter(|picture| {
-                    let bytes = picture.data.as_ref().map_or(0, String::len);
-                    left.checked_sub(bytes)
-                        .inspect(|rest| left = *rest)
-                        .is_some()
-                });
+            let source_repository = owner
+                .as_ref()
+                .map(|owner| &owner.id)
+                .or(repository.as_ref());
+            let picture = match source_repository {
+                Some(repository) => {
+                    self.thumbnails
+                        .ready(&reader, repository, &branch, &scene.path)
+                        .await
+                }
+                None => None,
+            }
+            .filter(|picture| {
+                let bytes = picture.data.as_ref().map_or(0, String::len);
+                left.checked_sub(bytes)
+                    .inspect(|rest| left = *rest)
+                    .is_some()
+            });
             scenes.push(Scene {
                 name: scene.name.clone(),
                 path,
@@ -289,7 +297,7 @@ impl UsdMcp {
     ) -> Result<StageThumbnail, ToolError> {
         let reader = self.reader(&context)?;
         self.thumbnails
-            .thumbnail(&reader, &request, &self.scenes)
+            .thumbnail(&reader, &request)
             .await
             .map_err(|error| refused("reading the stage", error))
     }

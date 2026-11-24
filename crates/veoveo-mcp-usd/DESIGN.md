@@ -85,7 +85,11 @@ what it read.
 
 `stage::gather` starts from the root's bytes and composes them with `usd_bevy`'s `UsdSource::from_memory`, which names the
 dependencies the stage asks for, under the variants a render chose, and does not have. It fetches those, by their paths
-relative to the repository's top, and composes again until nothing it can fetch is missing. A dependency Lore does not hold stays listed as missing, and an
+relative to the repository's top, and composes again until nothing it can fetch is missing.
+After reading the root it freezes every dependency read to that root's `Lore-Revision`,
+so a moving branch cannot mix layers from two pushes. The Hub resolves native linked
+paths at their pinned target revisions and independently authorizes each contributing
+repository as the current caller. A dependency Lore does not hold stays listed as missing, and an
 `inspect_stage` still reports the rest. Inspecting needs only layers, so it fetches files of the USD extensions; rendering
 needs textures too, so it fetches everything. Composition runs on a blocking thread, since a stage is not `Send`.
 
@@ -122,7 +126,12 @@ looks through a `UsdGeomCamera`, with its projection. A camera the stage does no
 ### Pictures
 
 `thumbnail` is one frame of a stage for a gallery, at its start, framing the whole stage, through the same child process as a render.
-Every call first reads the stage's first byte as the caller, so Lore decides it whatever is kept. The picture is kept under
+Every call first probes the root and every dependency recorded for the kept picture
+as the current caller, at the frozen root revision. The same check precedes pictures
+returned by `list_scenes`. A missing, changed or refused contributor prevents a cache
+hit; a parent grant and previously cached bytes grant no access to a linked layer.
+Dependency addresses come from their own authorized file responses, not the parent-only
+repository tree. Incomplete compositions receive no environment preview. No permission or credential is cached with a picture. The picture is kept under
 `VEOVEO_THUMBNAIL_DIRECTORY`, `/sandbox/state/thumbnails` on the factory's disk, by the stage's content address, and for a stage that is
 not one `.usdz` package by the branch's tip too, since a layer it names may have changed. Calls for one stage wait for one draw, and two
 draw at once, each up to 180 seconds. A stage that cannot be drawn answers no picture and is not tried again for an hour. It needs no
@@ -295,3 +304,12 @@ retention.
 | `src/render` unit tests | The frames file and its arguments |
 | `tests/mcp.rs` | Discovery, permission refusals, the App's document and links, the viewer's route and registration, and a skills manifest that names exactly the files under `skills/view-stages/`, each with the size and SHA-256 of the text a read answers |
 | `crates/usd_bevy` | The copied tests, with `UPSTREAM.md`'s changes |
+
+## Patched URL dependency boundary
+
+The linked-stage read and contributor-cache correction uses the qualified Core,
+SDK and Artifact client source revisions with upstream url 2.5.9, including
+RUSTSEC-2026-0592. It preserves USD's native contract and rendering implementation.
+Both complete Mac and Linux Docker gates qualify this source before publication.
+The matching Hub linked-file read is independently qualified and deployed before
+its composed-source behavior is claimed on the installation.

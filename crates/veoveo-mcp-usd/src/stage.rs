@@ -101,6 +101,9 @@ pub async fn gather(
     overrides: &UsdInstanceOverrides,
 ) -> Result<Gathered, StageError> {
     let root = reader.file(repository, branch, path.as_str()).await?;
+    // A branch may advance while composition fetches dependencies. Keep every
+    // logical path under the exact root revision, including its native link pins.
+    let frozen_branch = frozen_branch(root.revision.as_deref())?;
     let mut gathered = Gathered {
         root: path.clone(),
         files: BTreeMap::from([(path.as_str().to_owned(), Arc::from(&root.bytes[..]))]),
@@ -114,11 +117,14 @@ pub async fn gather(
             return Ok(gathered);
         }
         let fetched: Vec<Fetched> = stream::iter(wanted)
-            .map(|file| async move {
-                match reader.file(repository, branch, &file).await {
-                    Ok(answer) => Ok((file, Some(Arc::from(&answer.bytes[..])))),
-                    Err(error) if error.is_not_found() => Ok((file, None)),
-                    Err(error) => Err(error),
+            .map(|file| {
+                let frozen_branch = &frozen_branch;
+                async move {
+                    match reader.file(repository, frozen_branch, &file).await {
+                        Ok(answer) => Ok((file, Some(Arc::from(&answer.bytes[..])))),
+                        Err(error) if error.is_not_found() => Ok((file, None)),
+                        Err(error) => Err(error),
+                    }
                 }
             })
             .buffer_unordered(CONCURRENT_READS)
@@ -136,6 +142,19 @@ pub async fn gather(
         }
     }
     Err(StageError::Unsettled)
+}
+
+pub(crate) fn frozen_branch(revision: Option<&str>) -> Result<BranchName, StageError> {
+    let revision = revision
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| StageError::Compose("the root omitted its exact native revision".into()))?;
+    BranchName::parse(format!("@{revision}"))
+        .map_err(|error| StageError::Compose(error.to_string()))
 }
 
 /// What to fetch next: what the composed stage asks for that is not held and may be fetched.
@@ -346,6 +365,17 @@ def Xform "World" (
             address: "root-address".to_owned(),
             revision: Some("r1".to_owned()),
         }
+    }
+
+    #[test]
+    fn composed_dependencies_use_the_roots_exact_revision_after_alias_resolution() {
+        let revision = "ab".repeat(32);
+        assert_eq!(
+            frozen_branch(Some(&revision)).unwrap().as_str(),
+            format!("@{revision}")
+        );
+        assert!(frozen_branch(None).is_err());
+        assert!(frozen_branch(Some("latest")).is_err());
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! A stage's picture for a gallery: one frame drawn on the GPU as the caller, kept by the content
-//! it was drawn from. Every call first reads a byte of the stage as the caller, so Lore decides
-//! each one and a person without a grant learns nothing from what is kept. What is kept is only
+//! it was drawn from. Every cache response probes the root and contributing files as the caller,
+//! so a root grant cannot expose a separately owned linked layer from a warm cache. What is kept is only
 //! a small picture of a stage, under a name its content decides, and any of it can be drawn again.
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
     time::{Duration, SystemTime},
@@ -18,13 +19,12 @@ use usd_bevy::instance::UsdInstanceOverrides;
 use crate::{
     contract::{StageThumbnail, ThumbnailRequest, ThumbnailSize},
     hub::{HubError, Probe, Reader},
-    scenes::Scenes,
     stage::{self, Scope, StageError},
     work::{self, FRAME},
 };
 
 /// Changes when what is drawn changes, so that older pictures are drawn again.
-const RECIPE: &str = "2";
+const RECIPE: &str = "3";
 /// The width of a small picture. A large one is the frame as it was rendered.
 const SMALL_WIDTH: u32 = 480;
 /// How long a stage that could not be drawn is left before it is tried again.
@@ -64,13 +64,14 @@ impl Thumbnails {
         &self,
         reader: &Reader,
         request: &ThumbnailRequest,
-        scenes: &Scenes,
     ) -> Result<StageThumbnail, HubError> {
         let probe = reader
             .probe(&request.repository, &request.branch, request.path.as_str())
             .await?;
         let key = key(&probe, request.path.as_str());
-        if let Some(found) = self.kept(&key, request.size).await {
+        if self.reuse(reader, request, &probe, &key).await
+            && let Some(found) = self.kept(&key, request.size).await
+        {
             return Ok(found);
         }
         if self.failed_lately(&key).await {
@@ -78,10 +79,7 @@ impl Thumbnails {
         }
         let turn = self.turn(&key);
         let _turn = turn.lock().await;
-        if let Some(found) = self.kept(&key, request.size).await {
-            return Ok(found);
-        }
-        if self.reuse(reader, request, &probe, &key, scenes).await
+        if self.reuse(reader, request, &probe, &key).await
             && let Some(found) = self.kept(&key, request.size).await
         {
             return Ok(found);
@@ -89,10 +87,13 @@ impl Thumbnails {
         let Ok(_permit) = self.permits.acquire().await else {
             return Ok(StageThumbnail::default());
         };
+        let Ok(branch) = stage::frozen_branch(probe.revision.as_deref()) else {
+            return Ok(StageThumbnail::default());
+        };
         let gathered = match stage::gather(
             reader,
             &request.repository,
-            &request.branch,
+            &branch,
             &request.path,
             Scope::Everything,
             &UsdInstanceOverrides::default(),
@@ -111,10 +112,10 @@ impl Thumbnails {
                 return Ok(StageThumbnail::default());
             }
         };
-        match self
-            .draw(reader, request, gathered, &probe, &key, scenes)
-            .await
-        {
+        if !gathered.missing.is_empty() {
+            return Ok(StageThumbnail::default());
+        }
+        match self.draw(reader, request, gathered, &probe, &key).await {
             Ok(()) => Ok(self.kept(&key, request.size).await.unwrap_or_default()),
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "a stage's picture could not be drawn");
@@ -149,18 +150,26 @@ impl Thumbnails {
         self.directory.join(format!("{key}.draw-failed"))
     }
 
-    /// The small picture kept of a stage with this content on this tip, drawing nothing.
+    /// The small kept picture after fresh caller authorization of its contributing files, drawing nothing.
     pub async fn ready(
         &self,
-        address: &str,
-        revision: Option<&str>,
+        reader: &Reader,
+        repository: &crate::contract::RepositoryId,
+        branch: &crate::contract::BranchName,
         path: &str,
     ) -> Option<StageThumbnail> {
-        let probe = Probe {
-            address: address.to_owned(),
-            revision: revision.map(str::to_owned),
+        let probe = reader.probe(repository, branch, path).await.ok()?;
+        let request = ThumbnailRequest {
+            repository: repository.clone(),
+            branch: branch.clone(),
+            path: crate::contract::StagePath::parse(path).ok()?,
+            size: ThumbnailSize::Small,
         };
-        self.kept(&key(&probe, path), ThumbnailSize::Small).await
+        let key = key(&probe, path);
+        if !self.reuse(reader, &request, &probe, &key).await {
+            return None;
+        }
+        self.kept(&key, ThumbnailSize::Small).await
     }
 
     async fn kept(&self, key: &str, size: ThumbnailSize) -> Option<StageThumbnail> {
@@ -180,7 +189,6 @@ impl Thumbnails {
         request: &ThumbnailRequest,
         probe: &Probe,
         key: &str,
-        scenes: &Scenes,
     ) -> bool {
         let Ok(noted) = tokio::fs::read(self.uses_path(probe, request.path.as_str())).await else {
             return false;
@@ -188,14 +196,21 @@ impl Thumbnails {
         let Ok(uses) = serde_json::from_slice::<Uses>(&noted) else {
             return false;
         };
-        let Ok(tip) = scenes
-            .at_tip(reader, &request.repository, &request.branch)
-            .await
-        else {
+        let Ok(branch) = stage::frozen_branch(probe.revision.as_deref()) else {
             return false;
         };
-        if !uses.unchanged(&tip.addresses) {
+        let repository = &request.repository;
+        let branch = &branch;
+        if !uses
+            .readable_unchanged(|path| async move {
+                address_now(reader, repository, branch, &path).await
+            })
+            .await
+        {
             return false;
+        }
+        if uses.key == key {
+            return true;
         }
         for size in [ThumbnailSize::Small, ThumbnailSize::Large] {
             if tokio::fs::copy(self.path(&uses.key, size), self.path(key, size))
@@ -242,7 +257,6 @@ impl Thumbnails {
         gathered: stage::Gathered,
         probe: &Probe,
         key: &str,
-        scenes: &Scenes,
     ) -> anyhow::Result<()> {
         let read: Vec<String> = gathered.files.keys().cloned().collect();
         let absent: Vec<String> = gathered.missing.iter().cloned().collect();
@@ -267,17 +281,32 @@ impl Thumbnails {
         tokio::task::spawn_blocking(move || keep(&output, &small, &large))
             .await
             .map_err(|error| anyhow!("{error}"))??;
-        // A failure to note this only costs a later draw.
-        if let Ok(tip) = scenes
-            .at_tip(reader, &request.repository, &request.branch)
-            .await
-        {
-            let uses = Uses::of(key, read, absent, &tip.addresses);
-            if let Ok(noted) = serde_json::to_vec(&uses) {
-                let _ = tokio::fs::write(self.uses_path(probe, request.path.as_str()), noted).await;
+        // Failure to authorize/note any contributor prevents future cache hits.
+        let branch = stage::frozen_branch(probe.revision.as_deref())?;
+        let mut addresses = HashMap::new();
+        for path in read.iter().chain(absent.iter()) {
+            if let Some(address) = address_now(reader, &request.repository, &branch, path).await? {
+                addresses.insert(path.clone(), address);
             }
         }
+        let uses = Uses::of(key, read, absent, &addresses);
+        let noted = serde_json::to_vec(&uses)?;
+        tokio::fs::write(self.uses_path(probe, request.path.as_str()), noted).await?;
+
         Ok(())
+    }
+}
+
+async fn address_now(
+    reader: &Reader,
+    repository: &crate::contract::RepositoryId,
+    branch: &crate::contract::BranchName,
+    path: &str,
+) -> Result<Option<String>, HubError> {
+    match reader.probe(repository, branch, path).await {
+        Ok(probe) => Ok(Some(probe.address)),
+        Err(error) if error.is_not_found() => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -310,10 +339,22 @@ impl Uses {
         }
     }
 
-    fn unchanged(&self, addresses: &HashMap<String, String>) -> bool {
-        self.files
-            .iter()
-            .all(|(path, address)| addresses.get(path) == address.as_ref())
+    async fn readable_unchanged<F, Fut, E>(&self, mut probe: F) -> bool
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = Result<Option<String>, E>>,
+    {
+        for (path, expected) in &self.files {
+            // Old partial-stage pictures are not complete environment previews.
+            if expected.is_none() {
+                return false;
+            }
+            match probe(path.clone()).await {
+                Ok(current) if &current == expected => {}
+                _ => return false,
+            }
+        }
+        true
     }
 }
 
@@ -362,40 +403,72 @@ fn write_jpeg(image: &image::DynamicImage, path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_picture_stands_while_everything_its_stage_read_is_unchanged() {
-        let addresses = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
-            pairs
-                .iter()
-                .map(|(path, address)| ((*path).to_owned(), (*address).to_owned()))
-                .collect()
-        };
-        let then = addresses(&[
-            ("a/model.usdc", "1"),
-            ("a/t.png", "2"),
-            ("elsewhere.png", "3"),
+    #[tokio::test]
+    async fn kept_picture_requires_every_current_contributing_read() {
+        // Synthetic content-address fixtures. No renderer or image validity claim.
+        let addresses = HashMap::from([
+            ("root.usda".to_owned(), "root-content".to_owned()),
+            ("library/site.usda".to_owned(), "private-layer".to_owned()),
         ]);
         let uses = Uses::of(
-            "k",
-            vec!["a/model.usdc".to_owned(), "a/t.png".to_owned()],
-            vec!["a/gone.png".to_owned()],
-            &then,
+            "cached-picture",
+            addresses.keys().cloned().collect(),
+            Vec::new(),
+            &addresses,
         );
-        assert!(uses.unchanged(&then));
-        // Something the stage never read may change.
-        assert!(uses.unchanged(&addresses(&[
-            ("a/model.usdc", "1"),
-            ("a/t.png", "2"),
-            ("elsewhere.png", "9")
-        ])));
-        // What it read may not, nor may what it looked for appear, nor what it read go.
-        assert!(!uses.unchanged(&addresses(&[("a/model.usdc", "1"), ("a/t.png", "9")])));
-        assert!(!uses.unchanged(&addresses(&[
-            ("a/model.usdc", "1"),
-            ("a/t.png", "2"),
-            ("a/gone.png", "4")
-        ])));
-        assert!(!uses.unchanged(&addresses(&[("a/model.usdc", "1")])));
+        assert!(
+            uses.readable_unchanged(|path| std::future::ready(Ok::<_, ()>(
+                addresses.get(&path).cloned()
+            )))
+            .await
+        );
+        // The root remains readable and the cached image remains present. Revoked
+        // child authority still invalidates the cache hit, including a warm gallery.
+        assert!(
+            !uses
+                .readable_unchanged(|path| std::future::ready(if path.starts_with("library/") {
+                    Err(())
+                } else {
+                    Ok(addresses.get(&path).cloned())
+                }))
+                .await
+        );
+        assert!(
+            !uses
+                .readable_unchanged(|path| std::future::ready(Ok::<_, ()>(
+                    if path.starts_with("library/") {
+                        None
+                    } else {
+                        addresses.get(&path).cloned()
+                    }
+                )))
+                .await
+        );
+        assert!(
+            !uses
+                .readable_unchanged(|path| std::future::ready(Ok::<_, ()>(Some(
+                    if path.starts_with("library/") {
+                        "changed".into()
+                    } else {
+                        "root-content".into()
+                    }
+                ))))
+                .await
+        );
+        // A cache entry from an older partial composition cannot become a complete preview.
+        let partial = Uses::of(
+            "partial",
+            vec!["root.usda".into()],
+            vec!["library/missing.usda".into()],
+            &addresses,
+        );
+        assert!(
+            !partial
+                .readable_unchanged(|path| std::future::ready(Ok::<_, ()>(
+                    addresses.get(&path).cloned()
+                )))
+                .await
+        );
     }
 
     fn probe(revision: &str) -> Probe {
